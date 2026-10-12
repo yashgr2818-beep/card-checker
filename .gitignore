@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & secrets
+.env
+.env.*
+
+# Uploaded images (prevent pushing private business card photos)
+uploads/*
+!uploads/.gitkeep
+
+# Local settings & API keys
+settings.json
+*.json.local
+
+# Local database (SQLite)
+*.db
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db
