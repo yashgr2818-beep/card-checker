@@ -37,11 +37,13 @@ except Exception:
 # ==========================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "cards.db")
-SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+DB_PATH = os.path.join(DATA_DIR, "cards.db")
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Locate Tesseract executable
 def find_tesseract_path():
@@ -226,7 +228,7 @@ def run_robust_local_ocr(image: Image.Image) -> str:
     best_score = -1
     best_rot = 0
 
-    for rot in [0, 90, 180, 270]:
+    for rot in [0, 90, 270]:
         r = img_thumb.rotate(rot, expand=True) if rot != 0 else img_thumb
         g = r.convert("L")
         thresh = g.point(lambda p: 255 if p > 170 else 0)
@@ -255,8 +257,8 @@ def run_robust_local_ocr(image: Image.Image) -> str:
             best_score = score
             best_rot = rot
 
-        # Early exit: if right-side up (0 deg) already has email/phone/keywords, skip other 3 rotations!
-        if rot == 0 and score >= 80:
+        # Early exit: if right-side up (0 deg) already has text, skip testing sideways angles!
+        if rot == 0 and (score >= 35 or len(words) >= 5):
             break
 
     # Step 2: High-resolution multi-layout extraction on winning angle ONLY
