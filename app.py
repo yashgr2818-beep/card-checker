@@ -21,6 +21,14 @@ import pytesseract
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+# Optional PostgreSQL (Neon DB) support
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    PSYCOPG2_AVAILABLE = True
+except Exception:
+    PSYCOPG2_AVAILABLE = False
+
 # Optional Google GenAI SDK
 try:
     from google import genai
@@ -89,41 +97,140 @@ def save_settings(settings: Dict[str, Any]):
 
 
 # ==========================================
-# 2. DATABASE MANAGEMENT
+# 2. DATABASE MANAGEMENT (NEON POSTGRESQL & SQLITE)
 # ==========================================
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+
+def is_postgres_active() -> bool:
+    return bool(DATABASE_URL and PSYCOPG2_AVAILABLE)
+
+
+class UniversalCursor:
+    """Wrapper that normalizes SQL placeholders and dict outputs across SQLite & Postgres."""
+    def __init__(self, cursor, is_postgres: bool):
+        self._cursor = cursor
+        self.is_postgres = is_postgres
+
+    def execute(self, sql: str, params=None):
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        if params is not None:
+            return self._cursor.execute(sql, tuple(params) if isinstance(params, list) else params)
+        return self._cursor.execute(sql)
+
+    def fetchone(self) -> Optional[Dict[str, Any]]:
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def fetchall(self) -> List[Dict[str, Any]]:
+        rows = self._cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cursor, "lastrowid", None)
+
+    def close(self):
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+
+
+class DBConnection:
+    """Universal connection wrapper for Neon PostgreSQL and local SQLite."""
+    def __init__(self, raw_conn, is_postgres: bool):
+        self._conn = raw_conn
+        self.is_postgres = is_postgres
+
+    def cursor(self) -> UniversalCursor:
+        if self.is_postgres:
+            raw_cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            raw_cur = self._conn.cursor()
+        return UniversalCursor(raw_cur, self.is_postgres)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def get_db() -> DBConnection:
+    """Get database connection: Neon Cloud PostgreSQL if DATABASE_URL set, else local SQLite."""
+    if is_postgres_active():
+        try:
+            raw_conn = psycopg2.connect(DATABASE_URL)
+            return DBConnection(raw_conn, True)
+        except Exception as err:
+            print(f"[DB Warning] Could not connect to Neon PostgreSQL ({err}). Falling back to SQLite.")
+
+    raw_conn = sqlite3.connect(DB_PATH)
+    raw_conn.row_factory = sqlite3.Row
+    return DBConnection(raw_conn, False)
 
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            job_title TEXT,
-            company_name TEXT,
-            email TEXT,
-            phone_number TEXT,
-            website TEXT,
-            address TEXT,
-            services_products TEXT,
-            notes TEXT,
-            lead_status TEXT DEFAULT 'New',
-            tags TEXT,
-            image_filename TEXT,
-            ocr_engine TEXT,
-            raw_text TEXT,
-            created_at TEXT,
-            follow_up_date TEXT
+    if conn.is_postgres:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                job_title TEXT,
+                company_name TEXT,
+                email TEXT,
+                phone_number TEXT,
+                website TEXT,
+                address TEXT,
+                services_products TEXT,
+                notes TEXT,
+                lead_status TEXT DEFAULT 'New',
+                tags TEXT,
+                image_filename TEXT,
+                ocr_engine TEXT,
+                raw_text TEXT,
+                created_at TEXT,
+                follow_up_date TEXT
+            )
+            """
         )
-    """
-    )
+    else:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                job_title TEXT,
+                company_name TEXT,
+                email TEXT,
+                phone_number TEXT,
+                website TEXT,
+                address TEXT,
+                services_products TEXT,
+                notes TEXT,
+                lead_status TEXT DEFAULT 'New',
+                tags TEXT,
+                image_filename TEXT,
+                ocr_engine TEXT,
+                raw_text TEXT,
+                created_at TEXT,
+                follow_up_date TEXT
+            )
+            """
+        )
     conn.commit()
     conn.close()
 
@@ -621,35 +728,40 @@ def api_create_contact():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        """
+    query = """
         INSERT INTO contacts (
             name, job_title, company_name, email, phone_number,
             website, address, services_products, notes, lead_status,
             tags, image_filename, ocr_engine, raw_text, created_at, follow_up_date
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            data.get("name", "").strip(),
-            data.get("job_title", "").strip(),
-            data.get("company_name", "").strip(),
-            data.get("email", "").strip(),
-            data.get("phone_number", "").strip(),
-            data.get("website", "").strip(),
-            data.get("address", "").strip(),
-            data.get("services_products", "").strip(),
-            data.get("notes", "").strip(),
-            data.get("lead_status", "New").strip(),
-            data.get("tags", "").strip(),
-            data.get("image_filename", "").strip(),
-            data.get("ocr_engine", "Local Tesseract OCR").strip(),
-            data.get("raw_text", "").strip(),
-            now,
-            data.get("follow_up_date", "").strip(),
-        ),
+    """
+    params = (
+        data.get("name", "").strip(),
+        data.get("job_title", "").strip(),
+        data.get("company_name", "").strip(),
+        data.get("email", "").strip(),
+        data.get("phone_number", "").strip(),
+        data.get("website", "").strip(),
+        data.get("address", "").strip(),
+        data.get("services_products", "").strip(),
+        data.get("notes", "").strip(),
+        data.get("lead_status", "New").strip(),
+        data.get("tags", "").strip(),
+        data.get("image_filename", "").strip(),
+        data.get("ocr_engine", "Local Tesseract OCR").strip(),
+        data.get("raw_text", "").strip(),
+        now,
+        data.get("follow_up_date", "").strip(),
     )
+    if conn.is_postgres:
+        query += " RETURNING id"
+        c.execute(query, params)
+        res = c.fetchone()
+        new_id = res["id"] if res else 1
+    else:
+        c.execute(query, params)
+        new_id = c.lastrowid
     conn.commit()
-    new_id = c.lastrowid
     conn.close()
 
     return jsonify({"success": True, "id": new_id, "message": "Contact saved successfully."})
@@ -706,25 +818,31 @@ def api_get_stats():
     """Summary dashboard statistics."""
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM contacts")
-    total = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(*) FROM contacts WHERE lead_status = 'New'")
-    new_leads = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) as total FROM contacts")
+    res = c.fetchone()
+    total = res["total"] if res else 0
 
-    c.execute("SELECT COUNT(*) FROM contacts WHERE lead_status = 'Contacted'")
-    contacted = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) as new_leads FROM contacts WHERE lead_status = 'New'")
+    res = c.fetchone()
+    new_leads = res["new_leads"] if res else 0
 
-    c.execute("SELECT COUNT(*) FROM contacts WHERE lead_status = 'Qualified'")
-    qualified = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) as contacted FROM contacts WHERE lead_status = 'Contacted'")
+    res = c.fetchone()
+    contacted = res["contacted"] if res else 0
 
-    c.execute("SELECT COUNT(*) FROM contacts WHERE lead_status = 'Customer'")
-    customers = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) as qualified FROM contacts WHERE lead_status = 'Qualified'")
+    res = c.fetchone()
+    qualified = res["qualified"] if res else 0
+
+    c.execute("SELECT COUNT(*) as customers FROM contacts WHERE lead_status = 'Customer'")
+    res = c.fetchone()
+    customers = res["customers"] if res else 0
 
     c.execute(
         "SELECT company_name, COUNT(*) as cnt FROM contacts WHERE company_name != '' GROUP BY company_name ORDER BY cnt DESC LIMIT 5"
     )
-    top_companies = [dict(row) for row in c.fetchall()]
+    top_companies = c.fetchall()
 
     conn.close()
     return jsonify({
@@ -762,6 +880,8 @@ def api_settings():
         "engine_preference": settings.get("engine_preference", "hybrid"),
         "genai_sdk_installed": GENAI_AVAILABLE,
         "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
+        "is_postgres": is_postgres_active(),
+        "db_engine": "Neon Cloud PostgreSQL (Persistent)" if is_postgres_active() else "Local SQLite Database",
     })
 
 
@@ -1705,6 +1825,16 @@ FRONTEND_HTML = """
                     </select>
                 </div>
 
+                <div class="form-group" style="margin-bottom: 24px; padding: 14px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;">
+                    <label style="margin-bottom: 4px;">Database Storage</label>
+                    <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: #1e293b;">
+                        <span>💾</span> <span id="dbStatusText">Local SQLite Database</span>
+                    </div>
+                    <small style="color:var(--text-muted); display:block; margin-top:4px;">
+                        Set <code>DATABASE_URL</code> in Render to connect <a href="https://neon.tech" target="_blank" style="color:var(--primary);">Neon.tech PostgreSQL</a> for 100% free permanent storage.
+                    </small>
+                </div>
+
                 <div style="display: flex; gap: 12px;">
                     <button class="btn btn-primary" onclick="saveSettings()">💾 Save Settings</button>
                     <button class="btn btn-secondary" onclick="loadSettings()">🔄 Refresh</button>
@@ -2178,6 +2308,12 @@ FRONTEND_HTML = """
                 } else {
                     text.textContent = 'Local Tesseract OCR';
                     pill.className = 'engine-pill tesseract';
+                }
+
+                const dbText = document.getElementById('dbStatusText');
+                if (dbText) {
+                    dbText.textContent = data.db_engine || 'Local SQLite Database';
+                    dbText.style.color = data.is_postgres ? '#16a34a' : '#1e293b';
                 }
 
                 document.getElementById('enginePreferenceSelect').value = data.engine_preference || 'hybrid';
