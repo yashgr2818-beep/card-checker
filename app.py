@@ -257,9 +257,11 @@ def run_robust_local_ocr(image: Image.Image) -> str:
 
     # Step 2: High-resolution multi-layout extraction on winning angle ONLY
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
+    # Memory & speed guard for cloud servers (cap max dimension at 1800px to stay within 512MB RAM)
+    scale2 = min(1800 / max(best_rotated.width, best_rotated.height), 1.5)
     best_scaled = best_rotated.resize(
-        (int(best_rotated.width * 2.0), int(best_rotated.height * 2.0)),
-        Image.Resampling.LANCZOS,
+        (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
+        Image.Resampling.BILINEAR,
     )
     gray = best_scaled.convert("L")
     enh = ImageEnhance.Contrast(gray).enhance(2.0)
@@ -271,9 +273,8 @@ def run_robust_local_ocr(image: Image.Image) -> str:
 
     for img_variant, psm in [
         (thresh1, 6),
-        (enh, 4),
         (thresh2, 6),
-        (enh, 6),
+        (enh, 4),
     ]:
         try:
             t = pytesseract.image_to_string(img_variant, config=f"--psm {psm} --oem 3").strip()
@@ -1861,6 +1862,46 @@ FRONTEND_HTML = """
             if (files && files.length) handleFileSelect(files);
         });
 
+        // Helper to optimize image on browser before upload (faster upload & prevents server RAM spikes)
+        async function compressImageForUpload(file) {
+            return new Promise((resolve) => {
+                if (!file.type || !file.type.startsWith('image/')) return resolve(file);
+                const img = new Image();
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    img.onload = () => {
+                        const maxDim = 1800;
+                        let w = img.width, h = img.height;
+                        if (w > maxDim || h > maxDim) {
+                            if (w > h) {
+                                h = Math.round((h * maxDim) / w);
+                                w = maxDim;
+                            } else {
+                                w = Math.round((w * maxDim) / h);
+                                h = maxDim;
+                            }
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w;
+                        canvas.height = h;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, w, h);
+                        canvas.toBlob((blob) => {
+                            if (blob) {
+                                resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' }));
+                            } else {
+                                resolve(file);
+                            }
+                        }, 'image/jpeg', 0.92);
+                    };
+                    img.onerror = () => resolve(file);
+                    img.src = e.target.result;
+                };
+                reader.onerror = () => resolve(file);
+                reader.readAsDataURL(file);
+            });
+        }
+
         // BATCH / SINGLE FILE UPLOAD
         async function handleFileSelect(files) {
             if (!files || !files.length) return;
@@ -1872,8 +1913,6 @@ FRONTEND_HTML = """
 
             const formData = new FormData();
             for (let i = 0; i < files.length; i++) {
-                formData.append('images', files[i]);
-
                 // Create Queue Item Placeholder
                 const placeholder = document.createElement('div');
                 placeholder.className = 'queue-card';
@@ -1882,10 +1921,13 @@ FRONTEND_HTML = """
                     <div style="font-size:28px;">⏳</div>
                     <div class="queue-details">
                         <div class="queue-name">Scanning ${files[i].name}...</div>
-                        <div class="queue-comp">Processing OCR & Vision AI...</div>
+                        <div class="queue-comp">Optimizing & processing OCR...</div>
                     </div>
                 `;
                 queueList.appendChild(placeholder);
+
+                const optimizedFile = await compressImageForUpload(files[i]);
+                formData.append('images', optimizedFile);
             }
 
             try {
@@ -1893,9 +1935,21 @@ FRONTEND_HTML = """
                     method: 'POST',
                     body: formData
                 });
-                const res = await resp.json();
 
-                if (!resp.ok) throw new Error(res.error || 'Scan failed.');
+                if (!resp.ok) {
+                    let errMsg = `Server returned status ${resp.status}`;
+                    try {
+                        const errData = await resp.json();
+                        if (errData && errData.error) errMsg = errData.error;
+                    } catch (_) {
+                        if (resp.status === 502 || resp.status === 504) {
+                            errMsg = 'Server is waking up (Render free tier cold start). Please retry in 10 seconds.';
+                        }
+                    }
+                    throw new Error(errMsg);
+                }
+
+                const res = await resp.json();
 
                 queueList.innerHTML = '';
                 scannedCardsQueue = res.cards || [];
