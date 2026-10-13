@@ -345,11 +345,12 @@ def run_robust_local_ocr(image: Image.Image) -> str:
         except Exception:
             continue
 
-        score = 0
-        if "@" in t:
-            score += 100
-        if re.search(r"\+?\d[\d\s-]{8,}", t):
-            score += 50
+        words = re.findall(r"\b[A-Za-z]{3,}\b", t)
+        score = len(words) * 5
+
+        # Real email address format (not just a stray '@' symbol in graphics)
+        if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", t):
+            score += 80
         if re.search(r"\b(executive|manager|director|president|founder|engineer|developer|consultant|analyst|officer|sales|marketing)\b", t, re.I):
             score += 40
         if re.search(r"\b(services|technologies|solutions|steels|steel|industries|enterprises|limited|pvt|ltd|inc|corp|company|group|llp|llc)\b", t, re.I):
@@ -357,34 +358,27 @@ def run_robust_local_ocr(image: Image.Image) -> str:
         if re.search(r"\b(floor|road|marg|street|sector|nagar|block|mumbai|delhi|noida|india|office|branch)\b", t, re.I):
             score += 30
 
-        words = re.findall(r"\b[A-Za-z]{3,}\b", t)
-        score += len(words) * 2
-
         if score > best_score:
             best_score = score
             best_rot = rot
 
-        # Early exit: if right-side up (0 deg) already has text, skip testing sideways angles!
-        if rot == 0 and (score >= 35 or len(words) >= 5):
-            break
-
     # Step 2: High-resolution multi-layout extraction on winning angle ONLY
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
-    scale2 = min(1500 / max(best_rotated.width, best_rotated.height), 1.5)
-    best_scaled = best_rotated.resize(
+    scale2 = min(1600 / max(best_rotated.width, best_rotated.height), 1.0)
+    proc = best_rotated.resize(
         (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
         Image.Resampling.BILINEAR,
-    )
-    gray = best_scaled.convert("L")
+    ) if scale2 < 1.0 else best_rotated
+    gray = proc.convert("L")
     enh = ImageEnhance.Contrast(gray).enhance(2.0)
-    thresh2 = gray.point(lambda p: 255 if p > 180 else 0)
+    thresh170 = gray.point(lambda p: 255 if p > 170 else 0)
 
     all_lines = []
     seen = set()
 
     for img_variant, psm in [
-        (thresh2, 6),
-        (enh, 4),
+        (enh, 6),
+        (thresh170, 6),
     ]:
         try:
             t = pytesseract.image_to_string(img_variant, config=f"--psm {psm} --oem 3").strip()
@@ -442,16 +436,23 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         re.I,
     )
     for p in phone_matches:
-        d = re.sub(r"\D", "", p)
+        cand = re.split(r"[\r\n]", p)[0].strip(" ()-,.")
+        d = re.sub(r"\D", "", cand)
         if 10 <= len(d) <= 13:
-            phone = p.strip()
+            if len(d) > 12 and d.startswith("91"):
+                phone = f"+91-{d[2:7]} {d[7:12]}"
+            else:
+                phone = cand
             break
     if not phone:
         for m in re.finditer(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)", raw_text):
-            cand = m.group(0).strip()
+            cand = re.split(r"[\r\n]", m.group(0))[0].strip(" ()-,.")
             d = re.sub(r"\D", "", cand)
             if 10 <= len(d) <= 15:
-                phone = cand
+                if len(d) > 12 and d.startswith("91"):
+                    phone = f"+91-{d[2:7]} {d[7:12]}"
+                else:
+                    phone = cand
                 break
 
     # 4. Job Title
@@ -511,54 +512,85 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         company_name += " PVT. LTD."
 
     # 6. Name
+    def clean_person_name(cand: str) -> str:
+        if not cand:
+            return ""
+        # Strip phone numbers if present on the line
+        cand = re.sub(r"(?:Mob(?:ile)?|Ph(?:one)?|Tel)[\s.:-]*\+?[\d\s-]+[a-zA-Z]*", "", cand, flags=re.I)
+        # Strip non-alphabetic noise from the beginning and end
+        cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z\.]+$", "", cand).strip()
+        # Strip leading OCR noise tags like 'fee', 'tl', 'pet', or stray short letters/numbers
+        cand = re.sub(r"^(?:fee|tl|pet|\d+[a-zA-Z]*|[a-zA-Z]{1,2})\s+", "", cand, flags=re.I).strip()
+        # Strip trailing 1-2 character stray noise (e.g. 'i', 'x', 'a', etc.)
+        cand = re.sub(r"\s+[a-zA-Z]{1,2}$", "", cand).strip()
+        cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z\.]+$", "", cand).strip()
+        # Must have at least 3 alphabet letters and at least one vowel
+        alpha_only = re.sub(r"[^A-Za-z]", "", cand)
+        if len(alpha_only) >= 3 and re.search(r"[aeiouAEIOU]", cand):
+            return cand
+        return ""
+
+    # 1. First, search for name candidates directly adjacent to the Job Title (above or below)
+    name = ""
     name_candidates = []
-    for offset in [-1, 1, -2, 2]:
-        idx = job_idx + offset
-        if 0 <= idx < len(lines):
-            cand = lines[idx]
-            cand_clean = re.sub(r"(?:Mob(?:ile)?|Ph(?:one)?|Tel)[\s.:-]*\+?[\d\s-]+", "", cand, flags=re.I)
-            cand_clean = re.sub(r"[^A-Za-z\s\.]", "", cand_clean).strip()
-            if (
-                2 <= len(cand_clean) <= 30
-                and cand_clean != job_title
-                and not any(
-                    kw in cand_clean.lower()
-                    for kw in company_keywords + address_keywords + [
-                        "branch", "office", "floor", "rego", "ego", "inc", "steels",
-                        "services", "supplier", "plates"
-                    ]
-                )
-            ):
-                score = 10
-                if cand_clean.istitle():
-                    score += 20
-                if len(cand_clean.split()) in [1, 2, 3]:
-                    score += 10
-                name_candidates.append((score, cand_clean))
+    if job_idx >= 0:
+        for offset in [-1, 1, -2, 2]:
+            idx = job_idx + offset
+            if 0 <= idx < len(lines):
+                cand = clean_person_name(lines[idx])
+                if (
+                    cand
+                    and cand != job_title
+                    and not any(
+                        kw in cand.lower()
+                        for kw in company_keywords + address_keywords + [
+                            "branch", "office", "floor", "services", "steels",
+                            "supplier", "plates", "amtex", "entry", "sheet", "attended"
+                        ]
+                    )
+                ):
+                    score = 10
+                    if cand.istitle():
+                        score += 20
+                    elif cand.isupper():
+                        score += 15
+                    if len(cand.split()) in [2, 3]:
+                        score += 15
+                    name_candidates.append((score, cand))
 
     if name_candidates:
         name_candidates.sort(key=lambda x: x[0], reverse=True)
         name = name_candidates[0][1]
-    else:
-        name = ""
+
+    # 2. Next, check for explicit visitor label: 'Name of Visitor: Ajay Rajput' or 'Name: ...'
+    if not name:
         for line in lines:
-            cand_clean = re.sub(r"(?:Mob(?:ile)?|Ph(?:one)?|Tel)[\s.:-]*\+?[\d\s-]+", "", line, flags=re.I)
-            cand_clean = re.sub(r"[^A-Za-z\s\.]", "", cand_clean).strip()
+            m = re.search(r"(?:name\s*(?:of\s*visitor)?|visitor)[\s:|.-]+([A-Za-z\s.]{3,30})", line, re.I)
+            if m:
+                cleaned = clean_person_name(m.group(1))
+                if cleaned and not any(kw in cleaned.lower() for kw in ["attended", "company", "booth", "amtex"]):
+                    name = cleaned
+                    break
+
+    # 3. Fallback: inspect any clean 2-3 word capitalized or uppercase line
+    if not name:
+        for line in lines:
+            cand = clean_person_name(line)
             if (
-                2 <= len(cand_clean) <= 30
-                and cand_clean != job_title
-                and cand_clean != company_name
-                and cand_clean.istitle()
+                cand
+                and cand != job_title
+                and cand != company_name
+                and (cand.istitle() or cand.isupper() or len(cand.split()) in [2, 3])
                 and not any(
-                    kw in cand_clean.lower()
+                    kw in cand.lower()
                     for kw in address_keywords + company_keywords + [
                         "branch", "office", "floor", "road", "marg", "services",
                         "steels", "pvt", "ltd", "inc", "manufacturer", "supplier",
-                        "stockist", "plates"
+                        "stockist", "plates", "amtex", "entry", "sheet", "attended"
                     ]
                 )
             ):
-                name = cand_clean
+                name = cand
                 break
 
     # 7. Address
@@ -580,9 +612,12 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     services_products = " | ".join(services_lines[:2])
 
     if name:
-        name = re.sub(r"^[a-zA-Z]{1,2}\s+", "", name).strip()
+        name = clean_person_name(name)
     if job_title:
-        job_title = re.sub(r"^[a-zA-Z]{1,2}\s+", "", job_title).strip()
+        job_title = re.sub(r"^(?:tl|\d+[a-zA-Z]*|[a-zA-Z]{1,2})\s+", "", job_title, flags=re.I).strip(" ()")
+        m_title = re.search(r"^(.*?\b(?:executive|manager|director|president|founder|engineer|developer|consultant|analyst|officer|head|lead|specialist|partner|owner|coordinator|advisor)\b)", job_title, flags=re.I)
+        if m_title:
+            job_title = m_title.group(1).strip(" ()/\\;:-")
 
     return {
         "name": name,
