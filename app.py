@@ -216,10 +216,10 @@ def run_robust_local_ocr(image: Image.Image) -> str:
     image = ImageOps.exif_transpose(image)
     image = image.convert("RGB")
 
-    # Step 1: Orientation detection on normalized dimension
-    scale_factor = min(2000 / max(image.width, image.height), 2.0)
-    img_scan = image.resize(
-        (int(image.width * scale_factor), int(image.height * scale_factor)),
+    # Step 1: Ultra-fast orientation scan on lightweight 750px thumbnail (~0.2s per angle)
+    thumb_scale = min(750 / max(image.width, image.height), 1.0)
+    img_thumb = image.resize(
+        (int(image.width * thumb_scale), int(image.height * thumb_scale)),
         Image.Resampling.BILINEAR,
     )
 
@@ -227,9 +227,9 @@ def run_robust_local_ocr(image: Image.Image) -> str:
     best_rot = 0
 
     for rot in [0, 90, 180, 270]:
-        r = img_scan.rotate(rot, expand=True) if rot != 0 else img_scan
+        r = img_thumb.rotate(rot, expand=True) if rot != 0 else img_thumb
         g = r.convert("L")
-        thresh = g.point(lambda p: 255 if p > 165 else 0)
+        thresh = g.point(lambda p: 255 if p > 170 else 0)
 
         try:
             t = pytesseract.image_to_string(thresh, config="--psm 6 --oem 3").strip()
@@ -255,24 +255,25 @@ def run_robust_local_ocr(image: Image.Image) -> str:
             best_score = score
             best_rot = rot
 
+        # Early exit: if right-side up (0 deg) already has email/phone/keywords, skip other 3 rotations!
+        if rot == 0 and score >= 80:
+            break
+
     # Step 2: High-resolution multi-layout extraction on winning angle ONLY
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
-    # Memory & speed guard for cloud servers (cap max dimension at 1800px to stay within 512MB RAM)
-    scale2 = min(1800 / max(best_rotated.width, best_rotated.height), 1.5)
+    scale2 = min(1500 / max(best_rotated.width, best_rotated.height), 1.5)
     best_scaled = best_rotated.resize(
         (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
         Image.Resampling.BILINEAR,
     )
     gray = best_scaled.convert("L")
     enh = ImageEnhance.Contrast(gray).enhance(2.0)
-    thresh1 = gray.point(lambda p: 255 if p > 165 else 0)
     thresh2 = gray.point(lambda p: 255 if p > 180 else 0)
 
     all_lines = []
     seen = set()
 
     for img_variant, psm in [
-        (thresh1, 6),
         (thresh2, 6),
         (enh, 4),
     ]:
@@ -1888,7 +1889,7 @@ FRONTEND_HTML = """
                         ctx.drawImage(img, 0, 0, w, h);
                         canvas.toBlob((blob) => {
                             if (blob) {
-                                resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' }));
+                                resolve(new File([blob], file.name.replace(/\\.[^.]+$/, '.jpg'), { type: 'image/jpeg' }));
                             } else {
                                 resolve(file);
                             }
