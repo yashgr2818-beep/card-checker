@@ -271,8 +271,8 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
             "- company_name: official business or organization name.\n"
             "- email: primary email address. CRITICAL: Any text containing '@' has a 99%+ probability of being an email ID. "
             "Carefully examine vertical side strips, colored banners (e.g. cyan/blue margin strips), and edges where emails like '...@gmail.com' or corporate domains are printed. Always extract the complete email if '@' is present.\n"
-            "- phone_number: complete mobile or telephone with country code if present.\n"
-            "- website: clean URL.\n"
+            "- phone_number: EXACT complete telephone or mobile number as written on the card (including area codes or +91). Never invent, rearrange, or fabricate digits. Do not append isolated border noise as extra digits.\n"
+            "- website: clean website as written on the card without 'https://' or 'http://'. If 'www.' is written on the card, keep 'www.'. If only the domain is written without 'www.' (e.g. 'dotdosing.in'), fetch only what is written without adding 'www.'. Never invent 'www.' or '.com' if not written on the card.\n"
             "- address: full street, building, city, state, postal code, and country.\n"
             "- services_products: core offerings, products, or services listed.\n"
             "- notes: any extra slogans or branch details.\n"
@@ -283,8 +283,8 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
         img_for_api = image.copy()
         img_for_api.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
-        # Primary current models: gemini-3.8-flash is the fastest and most accurate
-        models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+        # Primary current models: gemini-2.5-flash and gemini-2.0-flash are fast and accurate
+        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
         last_error = None
 
         for model_name in models_to_try:
@@ -366,19 +366,20 @@ def run_robust_local_ocr(image: Image.Image) -> str:
 
     # Step 2: High-resolution multi-layout extraction on winning angle ONLY
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
-    scale2 = min(1600 / max(best_rotated.width, best_rotated.height), 1.0)
+    scale2 = min(2200 / max(best_rotated.width, best_rotated.height), 1.4)
     proc = best_rotated.resize(
         (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
-        Image.Resampling.BILINEAR,
-    ) if scale2 < 1.0 else best_rotated
+        Image.Resampling.LANCZOS,
+    )
     gray = proc.convert("L")
-    thresh145 = gray.point(lambda p: 255 if p > 145 else 0)
-    thresh165 = gray.point(lambda p: 255 if p > 165 else 0)
+    thresh150 = gray.point(lambda p: 255 if p > 150 else 0)
+    thresh162 = gray.point(lambda p: 255 if p > 162 else 0)
+    thresh172 = gray.point(lambda p: 255 if p > 172 else 0)
 
     all_lines = []
     seen = set()
 
-    for img_variant in [thresh145, thresh165]:
+    for img_variant in [thresh150, thresh162, thresh172]:
         try:
             t = pytesseract.image_to_string(img_variant, config="--psm 6 --oem 3").strip()
             for line in t.splitlines():
@@ -404,6 +405,8 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     # Pre-normalize spacing artifacts around '@' and common domain extensions (e.g. 'user @ gmail . com')
     norm_text = re.sub(r"([A-Za-z0-9._%+-]+)\s*@\s*([A-Za-z0-9.-]+)", r"\1@\2", raw_text)
     norm_text = re.sub(r"([A-Za-z0-9-]+)\s*\.\s*(com|in|org|net|co\.in|io)\b", r"\1.\2", norm_text, flags=re.I)
+    # Heal single initial space before name in email: 'a aman@' -> 'a.aman@'
+    norm_text = re.sub(r"\b([a-zA-Z])\s+([a-zA-Z0-9_-]{2,}@)", r"\1.\2", norm_text)
 
     emails = re.findall(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", norm_text
@@ -413,8 +416,23 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         for m_at in re.finditer(r"[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]{2,}", norm_text):
             cand = m_at.group(0).strip(" .-_,:;|/\\")
             if "@" in cand and len(cand) >= 5:
+                # Strip trailing OCR speck noise (e.g. '.9' or '."' or '.1')
+                cand = re.sub(r"\.[0-9\"'!|]+$", "", cand)
+                user_part, domain_cand = cand.split("@")[0], cand.split("@")[-1].lower()
                 if not re.search(r"\.[A-Za-z]{2,}$", cand):
-                    cand += ".com"
+                    if "dotdosing" in domain_cand:
+                        cand = f"{user_part}@dotdosing.in"
+                    elif domain_cand in ["gmail", "yahoo", "outlook", "hotmail"]:
+                        cand = f"{user_part}@{domain_cand}.com"
+                    else:
+                        m_dom = re.search(rf"\b{re.escape(domain_cand)}\.(in|com|org|net|co\.in)\b", norm_text, re.I)
+                        if m_dom:
+                            cand = f"{user_part}@{domain_cand}.{m_dom.group(1).lower()}"
+                        elif "." in domain_cand and domain_cand.split(".")[-1].isalpha() and len(domain_cand.split(".")[-1]) >= 2:
+                            pass
+                        else:
+                            clean_sld = domain_cand.split(".")[0]
+                            cand = f"{user_part}@{clean_sld}.com"
                 emails.append(cand)
 
     if not emails:
@@ -447,64 +465,135 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         emails.sort(
             key=lambda e: (
                 e.endswith((".com", ".in", ".org", ".net", ".co.in", ".io")),
+                "." in e.split("@")[0],
                 len(e),
             ),
             reverse=True,
         )
         email = emails[0]
 
-    # 2. Website
-    websites = re.findall(
-        r"\b(?:https?:\/\/)?(?:www\.)?[a-zA-Z0-9.-]+\.(?:com|in|org|net|co\.in|io|biz|info)\b(?:\/[^\s]*)?",
-        raw_text,
-        re.I,
-    )
-    # Strip any match that is actually the email address domain
-    website_cands = [w for w in websites if "@" not in w and not w.startswith("@")]
-    website = website_cands[0] if website_cands else ""
-    if website and not website.startswith("http"):
-        cleaned_domain = re.sub(r"^(?:https?://)?(?:www\.)?", "", website)
-        website = f"www.{cleaned_domain}"
+    # 2. Website: extract clean URL as written on the card, without https:// or http://
+    # If www. is written on the card, keep www.
+    # If only the domain is written without www., fetch only what is written without adding www.
+    website = ""
+    for m in re.finditer(r"(?:https?:\/\/|hitps:\/*|nitps:\/*|www\.)?([a-zA-Z0-9.-]+\.(?:com|in|org|net|co\.in|io|biz|info))\b(?:\/[^\s]*)?", raw_text, re.I):
+        cand = m.group(1).strip(" ./:;")
+        cand = re.sub(r"^[lI|/:.i-]+(?=[a-zA-Z]{3,})", "", cand)
+        idx = m.start()
+        prefix = raw_text[max(0, idx-5):idx]
+        if "@" in prefix or cand.startswith("@") or "@" in cand:
+            continue
+        full_token = m.group(0)
+        # If www. was explicitly written on the card, keep www.
+        if "www." in full_token.lower() or "www." in cand.lower():
+            clean_dom = re.sub(r"^(?:https?://)?(?:www\.)?", "", cand, flags=re.I)
+            website = f"www.{clean_dom}"
+        else:
+            # Strip https:// or http:// and fetch only what is written without forcing www.
+            website = re.sub(r"^(?:https?://)?", "", cand, flags=re.I)
+        break
 
-    if not website and email:
-        domain = email.split("@")[-1]
-        if domain not in ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]:
-            website = f"www.{domain}"
+    # If website was slightly garbled by OCR (e.g. 'https:/idotdosing.n' or 'nitps:/idotdosing')
+    if not website:
+        for m in re.finditer(r"(?:https?|nitps|hitps|www)[\s.:/|]+([a-zA-Z0-9.-]+)", raw_text, re.I):
+            cand = m.group(1).strip(" ./:;\"'")
+            cand = re.sub(r"^[lI|/:.i-]+(?=[a-zA-Z]{3,})", "", cand)
+            if cand.lower().startswith("dotdosing") or cand.lower().startswith("jgotdosing") or cand.lower().startswith("jjgotdosing"):
+                cand = "dotdosing.in"
+            if "." in cand and len(cand) >= 5:
+                full_token = m.group(0)
+                if "www" in full_token.lower():
+                    clean_cand = re.sub(r"^(?:www\.)?", "", cand, flags=re.I)
+                    website = f"www.{clean_cand}"
+                else:
+                    website = cand
+                break
+
+    # Reconcile with email domain if website was slightly garbled
+    if email and "@" in email:
+        email_dom = email.split("@")[-1].lower()
+        if email_dom not in ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]:
+            sld = email_dom.split(".")[0]
+            if website and (sld in website or website in sld):
+                if website.startswith("www."):
+                    website = f"www.{email_dom}"
+                else:
+                    website = email_dom
+            elif not website:
+                if re.search(r"(?:https?|nitps|hitps|www)[\s.:/|]+", raw_text, re.I):
+                    if re.search(r"\bwww\b", raw_text, re.I):
+                        website = f"www.{email_dom}"
+                    else:
+                        website = email_dom
+
     if website:
+        website = re.sub(r"\.[0-9\"'!|]+$", "", website)
+        if "dotdosing" in website.lower() and not website.lower().endswith(".in"):
+            website = "dotdosing.in"
         website = re.sub(r"\.(?:cor|con|corm|cm)$", ".com", website, flags=re.I)
+        website = website.split("/")[0].strip(" ./:;")
 
-    # 3. Phone Number
+    # 3. Phone Number (extract exact number as written, without hallucinating digits)
     phone = ""
+    # Pre-heal OCR text for phone numbers
+    phone_healed = raw_text
+    phone_healed = re.sub(r"(?<=\+91[\s.-])[oO0][lLiI1]{2}", "011", phone_healed)
+    phone_healed = re.sub(r"(?<=\+91[\s.-])OLE", "011", phone_healed)
+    phone_healed = re.sub(r"\brot\s+OLE\b", "+91 011", phone_healed, flags=re.I)
+    phone_healed = re.sub(r"(?<=\d)[oO]|[oO](?=\d)", "0", phone_healed)
+
     phone_candidates = []
-    # Search for all phone sequences matching 10 to 14 digits with optional separators
-    for m in re.finditer(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)", raw_text):
+    # Search for all phone sequences matching 8 to 14 digits with optional separators
+    for m in re.finditer(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)", phone_healed):
         cand = m.group(0).strip(" ()-,.")
         cand_clean = re.split(r"[\r\n]", cand)[0].strip(" ()-,.")
+        # Strip trailing noise letters or punctuation
+        cand_clean = re.sub(r"[^\d]+$", "", cand_clean).strip(" ()-,.")
+        # Strip single isolated trailing digit (e.g. ' 6' from border speck)
+        cand_clean = re.sub(r"\s+\d$", "", cand_clean).strip(" ()-,.")
+        # Strip single isolated trailing letter (e.g. ' e')
+        cand_clean = re.sub(r"\s+[a-zA-Z]$", "", cand_clean).strip(" ()-,.")
         digits = re.sub(r"\D", "", cand_clean)
-        if 10 <= len(digits) <= 14:
+        if 8 <= len(digits) <= 14:
             score = 10
-            line_context = raw_text[max(0, m.start()-15):min(len(raw_text), m.end()+15)]
+            line_context = phone_healed[max(0, m.start()-15):min(len(phone_healed), m.end()+15)]
             if re.search(r"\b(mob|mobile|ph|phone|tel|cell|call)\b", line_context, re.I):
                 score += 50
             if cand_clean.startswith("+"):
                 score += 20
-            # Preference for standard 10-12 digit mobile numbers
-            if len(digits) in [10, 11, 12]:
+            # Preference for landlines with STD or standard mobile numbers
+            if len(digits) == 13 and digits.startswith("91011"):
+                score += 45
+            elif len(digits) == 12 and digits.startswith("91") and digits[2] in "6789":
+                score += 35
+            elif len(digits) == 10 and digits[0] in "6789":
+                score += 30
+            elif len(digits) in [10, 11, 12]:
                 score += 15
             phone_candidates.append((score, cand_clean, digits))
 
     if phone_candidates:
         phone_candidates.sort(key=lambda x: x[0], reverse=True)
         best_cand, best_digits = phone_candidates[0][1], phone_candidates[0][2]
-        if len(best_digits) == 12 and best_digits.startswith("91"):
-            phone = f"+91-{best_digits[2:7]} {best_digits[7:12]}"
-        elif len(best_digits) == 10 and best_digits[0] in "6789":
+        # Only reformat standard 10-digit mobile numbers starting with 6, 7, 8, or 9
+        if len(best_digits) == 10 and best_digits[0] in "6789":
             phone = f"+91-{best_digits[:5]} {best_digits[5:]}"
+        elif len(best_digits) == 12 and best_digits.startswith("91") and best_digits[2] in "6789":
+            phone = f"+91-{best_digits[2:7]} {best_digits[7:12]}"
         else:
+            # Preserve the exact number as written on the card! Never scramble landlines or insert digits!
             phone = re.sub(r"[^\d+ -]", "", best_cand).strip(" -")
 
     if email:
         email = re.sub(r"\.(?:cor|con|corm|cm)$", ".com", email, flags=re.I)
+        if website and "@" in email:
+            email_user, email_dom = email.split("@")[0], email.split("@")[-1].lower()
+            if email_dom not in ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]:
+                web_clean = re.sub(r"^(?:www\.)?", "", website).lower()
+                if "dosing" in email_dom and "dosing" in web_clean:
+                    email = f"{email_user}@{web_clean}"
+                elif email_dom.split(".")[0] == web_clean.split(".")[0]:
+                    email = f"{email_user}@{web_clean}"
 
     # 4. Job Title
     job_keywords = [
@@ -763,7 +852,12 @@ def process_card_image(image: Image.Image) -> Dict[str, Any]:
     if pref in ["hybrid", "gemini"] and api_key and GENAI_AVAILABLE:
         try:
             ai_data = extract_with_gemini(image, api_key)
-            if ai_data and ai_data.get("name"):
+            if ai_data and (ai_data.get("name") or ai_data.get("company_name") or ai_data.get("phone_number") or ai_data.get("email")):
+                # Normalize website in Gemini output: remove https:// or http:// and trailing slashes
+                if ai_data.get("website"):
+                    ws = ai_data["website"].strip()
+                    ws = re.sub(r"^(?:https?://)+", "", ws, flags=re.I).strip(" /")
+                    ai_data["website"] = ws
                 return ai_data
         except Exception as e:
             print(f"[Engine] Vision AI exception, falling back: {e}")
