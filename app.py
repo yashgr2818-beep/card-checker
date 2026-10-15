@@ -8,6 +8,12 @@ import shutil
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from flask import (
     Flask,
     request,
@@ -76,6 +82,7 @@ pytesseract.pytesseract.tesseract_cmd = find_tesseract_path()
 def get_settings() -> Dict[str, Any]:
     default_settings = {
         "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "database_url": os.environ.get("DATABASE_URL", ""),
         "engine_preference": "hybrid",  # "hybrid", "gemini", "tesseract"
     }
     if os.path.isfile(SETTINGS_PATH):
@@ -88,6 +95,8 @@ def get_settings() -> Dict[str, Any]:
     # Env var always overrides empty key
     if not default_settings["gemini_api_key"] and os.environ.get("GEMINI_API_KEY"):
         default_settings["gemini_api_key"] = os.environ.get("GEMINI_API_KEY")
+    if not default_settings["database_url"] and os.environ.get("DATABASE_URL"):
+        default_settings["database_url"] = os.environ.get("DATABASE_URL")
     return default_settings
 
 
@@ -100,13 +109,18 @@ def save_settings(settings: Dict[str, Any]):
 # 2. DATABASE MANAGEMENT (NEON POSTGRESQL & SQLITE)
 # ==========================================
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def get_database_url() -> str:
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if not db_url:
+        settings = get_settings()
+        db_url = settings.get("database_url", "").strip()
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return db_url
 
 
 def is_postgres_active() -> bool:
-    return bool(DATABASE_URL and PSYCOPG2_AVAILABLE)
+    return bool(get_database_url() and PSYCOPG2_AVAILABLE)
 
 
 class UniversalCursor:
@@ -170,7 +184,7 @@ def get_db() -> DBConnection:
     """Get database connection: Neon Cloud PostgreSQL if DATABASE_URL set, else local SQLite."""
     if is_postgres_active():
         try:
-            raw_conn = psycopg2.connect(DATABASE_URL)
+            raw_conn = psycopg2.connect(get_database_url())
             return DBConnection(raw_conn, True)
         except Exception as err:
             print(f"[DB Warning] Could not connect to Neon PostgreSQL ({err}). Falling back to SQLite.")
@@ -1297,15 +1311,21 @@ def api_get_stats():
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
-    """Get or save API key and engine preferences."""
+    """Get or save API key, database URL, and engine preferences."""
     if request.method == "POST":
         data = request.json or {}
         settings = get_settings()
         if "gemini_api_key" in data:
             settings["gemini_api_key"] = data["gemini_api_key"].strip()
+        if "database_url" in data:
+            settings["database_url"] = data["database_url"].strip()
         if "engine_preference" in data:
             settings["engine_preference"] = data["engine_preference"].strip()
         save_settings(settings)
+        try:
+            init_db()
+        except Exception:
+            pass
         return jsonify({"success": True, "message": "Settings saved."})
 
     settings = get_settings()
@@ -1314,9 +1334,16 @@ def api_settings():
         raw = settings["gemini_api_key"]
         masked_key = raw[:4] + "..." + raw[-4:] if len(raw) > 8 else "***"
 
+    db_url = get_database_url()
+    masked_db = ""
+    if db_url:
+        masked_db = db_url[:15] + "..." + db_url[-8:] if len(db_url) > 25 else "***"
+
     return jsonify({
         "has_api_key": bool(settings.get("gemini_api_key")),
         "masked_api_key": masked_key,
+        "has_database_url": bool(db_url),
+        "masked_database_url": masked_db,
         "engine_preference": settings.get("engine_preference", "hybrid"),
         "genai_sdk_installed": GENAI_AVAILABLE,
         "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
@@ -2268,12 +2295,16 @@ FRONTEND_HTML = """
 
                 <div class="form-group" style="margin-bottom: 24px; padding: 14px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;">
                     <label style="margin-bottom: 4px;">Database Storage</label>
-                    <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: #1e293b;">
+                    <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: #1e293b; margin-bottom: 8px;">
                         <span>💾</span> <span id="dbStatusText">Local SQLite Database</span>
                     </div>
+                    <label style="font-size: 12px; margin-top: 8px; display:block;">Neon PostgreSQL Connection URL (Sync Local & Cloud):</label>
+                    <input type="password" id="databaseUrlInput" placeholder="postgresql://user:password@ep-xyz.neon.tech/neondb?sslmode=require" style="margin-top:4px;">
                     <small style="color:var(--text-muted); display:block; margin-top:4px;">
-                        Set <code>DATABASE_URL</code> in Render to connect <a href="https://neon.tech" target="_blank" style="color:var(--primary);">Neon.tech PostgreSQL</a> for 100% free permanent storage.
+                        Set here or via <code>DATABASE_URL</code> in Render to sync with <a href="https://neon.tech" target="_blank" style="color:var(--primary);">Neon.tech PostgreSQL</a>. Leave blank to use local SQLite.
                     </small>
+                </div>
+
                 <div class="form-group" style="margin-bottom: 24px; padding: 14px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px;">
                     <label style="margin-bottom: 4px; color: #166534; font-weight: 700;">🧠 AI Learning & Correction Memory</label>
                     <div style="display: flex; align-items: center; justify-content: space-between;">
@@ -2778,6 +2809,10 @@ FRONTEND_HTML = """
                     dbText.style.color = data.is_postgres ? '#16a34a' : '#1e293b';
                 }
 
+                if (data.masked_database_url) {
+                    document.getElementById('databaseUrlInput').placeholder = 'Connected: ' + data.masked_database_url;
+                }
+
                 document.getElementById('enginePreferenceSelect').value = data.engine_preference || 'hybrid';
 
                 // Load Learned Corrections Memory
@@ -2807,14 +2842,19 @@ FRONTEND_HTML = """
         }
 
         async function saveSettings() {
-            const key = document.getElementById('geminiApiKeyInput').value;
+            const key = document.getElementById('geminiApiKeyInput').value.trim();
             const pref = document.getElementById('enginePreferenceSelect').value;
+            const dbUrl = document.getElementById('databaseUrlInput').value.trim();
+
+            const payload = { engine_preference: pref };
+            if (key) payload.gemini_api_key = key;
+            if (dbUrl) payload.database_url = dbUrl;
 
             try {
                 const resp = await fetch('/api/settings', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ gemini_api_key: key, engine_preference: pref })
+                    body: JSON.stringify(payload)
                 });
                 const res = await resp.json();
                 alert(res.message || 'Settings saved!');
@@ -2876,4 +2916,14 @@ FRONTEND_HTML = """
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+
+    # Local development: automatically open the browser directly
+    if not os.environ.get("RENDER"):
+        import webbrowser
+        import threading
+        def open_local_browser():
+            webbrowser.open(f"http://127.0.0.1:{port}")
+        threading.Timer(1.2, open_local_browser).start()
+        print(f"\n[Card Scanner] Running locally at http://127.0.0.1:{port} (Opening browser automatically...)\n")
+
     app.run(host="0.0.0.0", port=port, debug=False)
