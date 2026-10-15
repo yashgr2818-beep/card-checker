@@ -207,6 +207,18 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corrections_memory (
+                id SERIAL PRIMARY KEY,
+                field_name TEXT NOT NULL,
+                wrong_value TEXT,
+                corrected_value TEXT NOT NULL,
+                raw_text_snippet TEXT,
+                created_at TEXT
+            )
+            """
+        )
     else:
         c.execute(
             """
@@ -231,11 +243,132 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corrections_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                field_name TEXT NOT NULL,
+                wrong_value TEXT,
+                corrected_value TEXT NOT NULL,
+                raw_text_snippet TEXT,
+                created_at TEXT
+            )
+            """
+        )
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+def record_correction(field_name: str, wrong_val: str, correct_val: str, raw_text: str = ""):
+    """Record a user correction to teach the AI and heuristic engines."""
+    field_name = (field_name or "").strip()
+    wrong_val = (wrong_val or "").strip()
+    correct_val = (correct_val or "").strip()
+    if not field_name or not correct_val or wrong_val == correct_val:
+        return
+    if len(correct_val) > 250 or len(wrong_val) > 250:
+        return
+
+    snippet = (raw_text or "")[:300].strip()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT id FROM corrections_memory WHERE field_name = ? AND wrong_value = ? AND corrected_value = ? LIMIT 1",
+            (field_name, wrong_val, correct_val),
+        )
+        if c.fetchone():
+            conn.close()
+            return
+
+        c.execute(
+            """
+            INSERT INTO corrections_memory (field_name, wrong_value, corrected_value, raw_text_snippet, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (field_name, wrong_val, correct_val, snippet, now),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Memory Warning] Could not record correction: {e}")
+
+
+def get_learned_corrections(limit: int = 20) -> List[Dict[str, Any]]:
+    """Retrieve recent user corrections from memory."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, field_name, wrong_value, corrected_value, created_at FROM corrections_memory ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = c.fetchall()
+        conn.close()
+        results = []
+        for r in rows:
+            results.append({
+                "id": r["id"],
+                "field_name": r["field_name"],
+                "wrong_value": r["wrong_value"],
+                "corrected_value": r["corrected_value"],
+                "created_at": r["created_at"],
+            })
+        return results
+    except Exception as e:
+        print(f"[Memory Warning] Could not fetch corrections: {e}")
+        return []
+
+
+def build_learned_rules_prompt() -> str:
+    """Synthesize learned guidelines and recent user corrections for the AI prompt."""
+    rules = [
+        "LEARNED USER RULES & HISTORICAL CORRECTIONS (Strictly adhere to these):",
+        "- If a phone number is an Indian landline with STD code (e.g. 011 for Delhi, 022 for Mumbai), keep '+91 <STD> <NUMBER>' and do NOT format as mobile.",
+        "- Never append stray isolated edge/border noise digits (e.g. stray '6' or specks) to phone numbers.",
+        "- For website URLs: fetch clean URL as written without 'https://' or 'http://'. Only keep 'www.' if 'www.' is written on the card; if only domain is written (e.g. 'dotdosing.in'), fetch only what is written without adding 'www.'.",
+        "- Text with '@' has 99%+ priority of being an email address.",
+    ]
+    corrections = get_learned_corrections(limit=8)
+    if corrections:
+        rules.append("\nRecent direct human corrections from past card scans:")
+        for cor in corrections:
+            rules.append(f"- Field '{cor['field_name']}': when OCR yielded '{cor['wrong_value']}', the user verified correct value is '{cor['corrected_value']}'.")
+    return "\n".join(rules)
+
+
+def apply_learned_corrections(data: Dict[str, Any], raw_text: str):
+    """Apply stored user corrections to fields if matching patterns are detected."""
+    corrections = get_learned_corrections(limit=30)
+    if not corrections:
+        return
+    for cor in corrections:
+        f_name = cor["field_name"]
+        w_val = cor["wrong_value"].strip()
+        c_val = cor["corrected_value"].strip()
+        curr_val = data.get(f_name, "").strip()
+        if curr_val and curr_val.lower() == w_val.lower():
+            data[f_name] = c_val
+        elif f_name == "website" and curr_val:
+            w_clean = re.sub(r"^(?:https?://)?(?:www\.)?", "", w_val).lower().strip(" /")
+            curr_clean = re.sub(r"^(?:https?://)?(?:www\.)?", "", curr_val).lower().strip(" /")
+            if w_clean and w_clean == curr_clean:
+                data["website"] = c_val
+
+
+INDIAN_STD_CODES = [
+    "011", "022", "033", "044", "080", "040", "079", "020",
+    "0120", "0124", "0129", "0141", "0522", "0512", "0712",
+    "0731", "0755", "0612", "0265", "0161", "0562", "0253",
+    "0121", "0281", "0542", "0183", "0532", "0751", "0761",
+    "0422", "0866", "0291", "0452", "0771", "0744", "0172",
+    "0361", "0821", "0181", "0674", "0471", "0484", "0135",
+    "0294", "0240", "0194",
+]
 
 
 # ==========================================
@@ -278,6 +411,10 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
             "- notes: any extra slogans or branch details.\n"
             "Note: Cards may be oriented horizontally or vertically. Read text in all directions."
         )
+
+        learned_rules = build_learned_rules_prompt()
+        if learned_rules:
+            prompt += f"\n\n{learned_rules}"
 
         # Resize for ultra-fast network transfer while maintaining crystal-clear text
         img_for_api = image.copy()
@@ -575,14 +712,31 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     if phone_candidates:
         phone_candidates.sort(key=lambda x: x[0], reverse=True)
         best_cand, best_digits = phone_candidates[0][1], phone_candidates[0][2]
-        # Only reformat standard 10-digit mobile numbers starting with 6, 7, 8, or 9
-        if len(best_digits) == 10 and best_digits[0] in "6789":
-            phone = f"+91-{best_digits[:5]} {best_digits[5:]}"
-        elif len(best_digits) == 12 and best_digits.startswith("91") and best_digits[2] in "6789":
-            phone = f"+91-{best_digits[2:7]} {best_digits[7:12]}"
-        else:
-            # Preserve the exact number as written on the card! Never scramble landlines or insert digits!
-            phone = re.sub(r"[^\d+ -]", "", best_cand).strip(" -")
+        # Check for Indian landline with STD code (e.g. +91 011 43074427 or 011 43074427)
+        matched_landline = False
+        for std in sorted(INDIAN_STD_CODES, key=len, reverse=True):
+            if best_digits.startswith("91" + std):
+                subscriber = best_digits[2+len(std):]
+                if len(subscriber) >= 6:
+                    phone = f"+91 {std} {subscriber}"
+                    matched_landline = True
+                    break
+            elif best_digits.startswith(std):
+                subscriber = best_digits[len(std):]
+                if len(subscriber) >= 6:
+                    phone = f"+91 {std} {subscriber}"
+                    matched_landline = True
+                    break
+
+        if not matched_landline:
+            # Only reformat standard 10-digit mobile numbers starting with 6, 7, 8, or 9
+            if len(best_digits) == 10 and best_digits[0] in "6789":
+                phone = f"+91-{best_digits[:5]} {best_digits[5:]}"
+            elif len(best_digits) == 12 and best_digits.startswith("91") and best_digits[2] in "6789":
+                phone = f"+91-{best_digits[2:7]} {best_digits[7:12]}"
+            else:
+                # Preserve the exact number as written on the card!
+                phone = re.sub(r"[^\d+ -]", "", best_cand).strip(" -")
 
     if email:
         email = re.sub(r"\.(?:cor|con|corm|cm)$", ".com", email, flags=re.I)
@@ -828,7 +982,7 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         if m_title:
             job_title = m_title.group(1).strip(" ()/\\;:-")
 
-    return {
+    res = {
         "name": name,
         "job_title": job_title,
         "company_name": company_name,
@@ -840,6 +994,8 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         "notes": "",
         "ocr_engine": "Local Tesseract OCR",
     }
+    apply_learned_corrections(res, raw_text)
+    return res
 
 
 def process_card_image(image: Image.Image) -> Dict[str, Any]:
@@ -1013,15 +1169,43 @@ def api_create_contact():
     conn.commit()
     conn.close()
 
+    # Record any user corrections made during card review into learning memory
+    original = data.get("original_scanned") or {}
+    raw_text = data.get("raw_text", "")
+    for field in ["name", "job_title", "company_name", "email", "phone_number", "website", "address"]:
+        orig_val = (original.get(field) or "").strip()
+        new_val = (data.get(field) or "").strip()
+        if orig_val and new_val and orig_val != new_val:
+            record_correction(field, orig_val, new_val, raw_text)
+
     return jsonify({"success": True, "id": new_id, "message": "Contact saved successfully."})
 
 
 @app.route("/api/contacts/<int:cid>", methods=["PUT"])
 def api_update_contact(cid):
-    """Update contact fields."""
+    """Update contact fields and record corrections."""
     data = request.json or {}
     conn = get_db()
     c = conn.cursor()
+
+    # Learn from manual edits to previously saved contacts
+    c.execute("SELECT * FROM contacts WHERE id = ?", (cid,))
+    old_row = c.fetchone()
+    if old_row:
+        raw_text = ""
+        try:
+            raw_text = old_row["raw_text"] or ""
+        except Exception:
+            pass
+        for field in ["name", "job_title", "company_name", "email", "phone_number", "website", "address"]:
+            try:
+                old_val = (old_row[field] or "").strip()
+                new_val = (data.get(field) or "").strip()
+                if old_val and new_val and old_val != new_val:
+                    record_correction(field, old_val, new_val, raw_text)
+            except Exception:
+                pass
+
     c.execute(
         """
         UPDATE contacts SET
@@ -1049,6 +1233,13 @@ def api_update_contact(cid):
     conn.commit()
     conn.close()
     return jsonify({"success": True, "message": "Contact updated."})
+
+
+@app.route("/api/corrections", methods=["GET"])
+def api_get_corrections():
+    """Return learned corrections memory."""
+    corrections = get_learned_corrections(limit=50)
+    return jsonify({"corrections": corrections, "count": len(corrections)})
 
 
 @app.route("/api/contacts/<int:cid>", methods=["DELETE"])
@@ -2083,6 +2274,13 @@ FRONTEND_HTML = """
                     <small style="color:var(--text-muted); display:block; margin-top:4px;">
                         Set <code>DATABASE_URL</code> in Render to connect <a href="https://neon.tech" target="_blank" style="color:var(--primary);">Neon.tech PostgreSQL</a> for 100% free permanent storage.
                     </small>
+                <div class="form-group" style="margin-bottom: 24px; padding: 14px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px;">
+                    <label style="margin-bottom: 4px; color: #166534; font-weight: 700;">🧠 AI Learning & Correction Memory</label>
+                    <div style="display: flex; align-items: center; justify-content: space-between;">
+                        <span style="font-size: 13px; color: #15803d;" id="memoryStatusText">Memory Active: Learning from your verified card edits</span>
+                        <span class="badge" style="background:#22c55e; color:#fff;" id="memoryCountBadge">0 Learned Rules</span>
+                    </div>
+                    <div id="memoryList" style="margin-top: 10px; max-height: 150px; overflow-y: auto; font-size: 12px; color: #334155;"></div>
                 </div>
 
                 <div style="display: flex; gap: 12px;">
@@ -2363,7 +2561,20 @@ FRONTEND_HTML = """
         }
 
         // REVIEW / EDIT MODAL
+        let currentScannedOriginal = null;
+
         function openReviewModal(cardData, isEditMode = false) {
+            currentScannedOriginal = {
+                name: cardData.name || '',
+                job_title: cardData.job_title || '',
+                company_name: cardData.company_name || '',
+                phone_number: cardData.phone_number || '',
+                email: cardData.email || '',
+                website: cardData.website || '',
+                address: cardData.address || '',
+                services_products: cardData.services_products || ''
+            };
+
             document.getElementById('editContactId').value = cardData.id || '';
             document.getElementById('cardImageFilename').value = cardData.image_filename || '';
             document.getElementById('cardOcrEngine').value = cardData.ocr_engine || 'Local Tesseract OCR';
@@ -2415,7 +2626,8 @@ FRONTEND_HTML = """
                 notes: document.getElementById('fieldNotes').value.trim(),
                 image_filename: document.getElementById('cardImageFilename').value,
                 ocr_engine: document.getElementById('cardOcrEngine').value,
-                raw_text: document.getElementById('cardRawText').value
+                raw_text: document.getElementById('cardRawText').value,
+                original_scanned: currentScannedOriginal || {}
             };
 
             const url = id ? `/api/contacts/${id}` : '/api/contacts';
@@ -2567,6 +2779,28 @@ FRONTEND_HTML = """
                 }
 
                 document.getElementById('enginePreferenceSelect').value = data.engine_preference || 'hybrid';
+
+                // Load Learned Corrections Memory
+                try {
+                    const corResp = await fetch('/api/corrections');
+                    const corData = await corResp.json();
+                    const memBadge = document.getElementById('memoryCountBadge');
+                    const memList = document.getElementById('memoryList');
+                    if (memBadge && corData) {
+                        memBadge.textContent = `${corData.count || 0} Learned Rules`;
+                        if (corData.corrections && corData.corrections.length > 0) {
+                            memList.innerHTML = corData.corrections.slice(0, 5).map(c => 
+                                `<div style="padding:4px 0; border-bottom:1px dashed #cbd5e1;">` +
+                                `• Corrected <b>${c.field_name}</b>: <code>${c.wrong_value}</code> ➔ <b>${c.corrected_value}</b>` +
+                                `</div>`
+                            ).join('');
+                        } else {
+                            memList.innerHTML = '<em>No corrections needed yet. When you edit any scanned card in review modal, the AI learns automatically.</em>';
+                        }
+                    }
+                } catch (cErr) {
+                    console.log('Correction memory fetch:', cErr);
+                }
             } catch (err) {
                 console.error(err);
             }
