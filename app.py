@@ -440,7 +440,8 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     website_cands = [w for w in websites if "@" not in w and not w.startswith("@")]
     website = website_cands[0] if website_cands else ""
     if website and not website.startswith("http"):
-        website = f"www.{re.sub(r'^(?:https?:\/\/)?(?:www\.)?', '', website)}"
+        cleaned_domain = re.sub(r"^(?:https?://)?(?:www\.)?", "", website)
+        website = f"www.{cleaned_domain}"
 
     if not website and email:
         domain = email.split("@")[-1]
@@ -1043,6 +1044,7 @@ def export_excel():
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     thin_border = Border(
         left=Side(style="thin", color="CBD5E1"),
+        
         right=Side(style="thin", color="CBD5E1"),
         top=Side(style="thin", color="CBD5E1"),
         bottom=Side(style="thin", color="CBD5E1")
