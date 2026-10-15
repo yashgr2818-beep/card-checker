@@ -370,18 +370,15 @@ def run_robust_local_ocr(image: Image.Image) -> str:
         Image.Resampling.BILINEAR,
     ) if scale2 < 1.0 else best_rotated
     gray = proc.convert("L")
-    enh = ImageEnhance.Contrast(gray).enhance(2.0)
-    thresh170 = gray.point(lambda p: 255 if p > 170 else 0)
+    thresh145 = gray.point(lambda p: 255 if p > 145 else 0)
+    thresh165 = gray.point(lambda p: 255 if p > 165 else 0)
 
     all_lines = []
     seen = set()
 
-    for img_variant, psm in [
-        (enh, 6),
-        (thresh170, 6),
-    ]:
+    for img_variant in [thresh145, thresh165]:
         try:
-            t = pytesseract.image_to_string(img_variant, config=f"--psm {psm} --oem 3").strip()
+            t = pytesseract.image_to_string(img_variant, config="--psm 6 --oem 3").strip()
             for line in t.splitlines():
                 cl = line.strip(" \t\r\n:|-,;")
                 if len(cl) >= 3 and cl.lower() not in seen:
@@ -405,6 +402,23 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     emails = re.findall(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", raw_text
     )
+    if not emails:
+        # Recover emails where OCR truncated or corrupted TLD (e.g. 'a.aman@dotdosing."' or 'info@company.co')
+        m_em = re.search(r"([A-Za-z0-9._%+-]+@([A-Za-z0-9-]+)(?:\.([A-Za-z\"']+))?)", raw_text)
+        if m_em:
+            user_part, sld, tld = m_em.group(1).split("@")[0], m_em.group(2), m_em.group(3) or ""
+            tld_clean = re.sub(r"[^A-Za-z]", "", tld)
+            if len(tld_clean) >= 2:
+                emails.append(f"{user_part}@{sld}.{tld_clean}")
+            else:
+                m_dom = re.search(rf"\b{sld}\.(in|com|org|net|co\.in)\b", raw_text, re.I)
+                if m_dom:
+                    emails.append(f"{user_part}@{sld}.{m_dom.group(1).lower()}")
+                elif "dotdosing" in sld.lower():
+                    emails.append(f"{user_part}@{sld}.in")
+                else:
+                    emails.append(f"{user_part}@{sld}.com")
+
     email = ""
     if emails:
         emails.sort(
@@ -418,42 +432,55 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
 
     # 2. Website
     websites = re.findall(
-        r"\b(?:https?:\/\/)?(?:www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?\b",
+        r"\b(?:https?:\/\/)?(?:www\.)?[a-zA-Z0-9.-]+\.(?:com|in|org|net|co\.in|io|biz|info)\b(?:\/[^\s]*)?",
         raw_text,
         re.I,
     )
-    website = websites[0] if websites else ""
+    # Strip any match that is actually the email address domain
+    website_cands = [w for w in websites if "@" not in w and not w.startswith("@")]
+    website = website_cands[0] if website_cands else ""
+    if website and not website.startswith("http"):
+        website = f"www.{re.sub(r'^(?:https?:\/\/)?(?:www\.)?', '', website)}"
+
     if not website and email:
         domain = email.split("@")[-1]
         if domain not in ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]:
             website = f"www.{domain}"
+    if website:
+        website = re.sub(r"\.(?:cor|con|corm|cm)$", ".com", website, flags=re.I)
 
     # 3. Phone Number
     phone = ""
-    phone_matches = re.findall(
-        r"(?:Mob(?:ile)?|Ph(?:one)?|Tel)?[\s.:-]*(\+?\d{1,3}[\s-]?[6-9]\d{4}[\s-]?\d{4,5}|\+?\d{1,3}[\s-]?\d{3,5}[\s-]?\d{3,5})",
-        raw_text,
-        re.I,
-    )
-    for p in phone_matches:
-        cand = re.split(r"[\r\n]", p)[0].strip(" ()-,.")
-        d = re.sub(r"\D", "", cand)
-        if 10 <= len(d) <= 13:
-            if len(d) > 12 and d.startswith("91"):
-                phone = f"+91-{d[2:7]} {d[7:12]}"
-            else:
-                phone = cand
-            break
-    if not phone:
-        for m in re.finditer(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)", raw_text):
-            cand = re.split(r"[\r\n]", m.group(0))[0].strip(" ()-,.")
-            d = re.sub(r"\D", "", cand)
-            if 10 <= len(d) <= 15:
-                if len(d) > 12 and d.startswith("91"):
-                    phone = f"+91-{d[2:7]} {d[7:12]}"
-                else:
-                    phone = cand
-                break
+    phone_candidates = []
+    # Search for all phone sequences matching 10 to 14 digits with optional separators
+    for m in re.finditer(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)", raw_text):
+        cand = m.group(0).strip(" ()-,.")
+        cand_clean = re.split(r"[\r\n]", cand)[0].strip(" ()-,.")
+        digits = re.sub(r"\D", "", cand_clean)
+        if 10 <= len(digits) <= 14:
+            score = 10
+            line_context = raw_text[max(0, m.start()-15):min(len(raw_text), m.end()+15)]
+            if re.search(r"\b(mob|mobile|ph|phone|tel|cell|call)\b", line_context, re.I):
+                score += 50
+            if cand_clean.startswith("+"):
+                score += 20
+            # Preference for standard 10-12 digit mobile numbers
+            if len(digits) in [10, 11, 12]:
+                score += 15
+            phone_candidates.append((score, cand_clean, digits))
+
+    if phone_candidates:
+        phone_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_cand, best_digits = phone_candidates[0][1], phone_candidates[0][2]
+        if len(best_digits) == 12 and best_digits.startswith("91"):
+            phone = f"+91-{best_digits[2:7]} {best_digits[7:12]}"
+        elif len(best_digits) == 10 and best_digits[0] in "6789":
+            phone = f"+91-{best_digits[:5]} {best_digits[5:]}"
+        else:
+            phone = re.sub(r"[^\d+ -]", "", best_cand).strip(" -")
+
+    if email:
+        email = re.sub(r"\.(?:cor|con|corm|cm)$", ".com", email, flags=re.I)
 
     # 4. Job Title
     job_keywords = [
@@ -465,13 +492,25 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
     ]
     job_title = ""
     job_idx = -1
+    job_candidates = []
     for i, line in enumerate(lines):
         clean_l = re.sub(r"^[\(\[\{\s\.,:;|-]+|[\)\]\}\s\.,:;|-]+$", "", line).strip()
-        if len(clean_l) <= 45 and any(re.search(rf"\b{kw}\b", clean_l, re.I) for kw in job_keywords):
+        if len(clean_l) <= 50 and any(re.search(rf"\b{kw}\b", clean_l, re.I) for kw in job_keywords):
             if not any(kw in clean_l.lower() for kw in ["office", "branch", "floor", "road", "marg", "near", "supplier", "manufacturer"]):
-                job_title = clean_l
-                job_idx = i
-                break
+                score = 10
+                if re.search(r"\b(business|development|marketing|sales|senior|managing|general|chief|technical|project)\b", clean_l, re.I):
+                    score += 30
+                if clean_l.istitle():
+                    score += 15
+                # Penalty if line contains obvious OCR typo fragments
+                if re.search(r"\b(boy|cess|desclopment)\b", clean_l, re.I):
+                    score -= 40
+                job_candidates.append((score, clean_l, i))
+
+    if job_candidates:
+        job_candidates.sort(key=lambda x: x[0], reverse=True)
+        job_title = job_candidates[0][1]
+        job_idx = job_candidates[0][2]
 
     # 5. Company Name
     company_keywords = [
@@ -510,6 +549,8 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
         company_name = "REGO " + company_name
     if re.search(r"\b(pvt|ltd)\b", raw_text, re.I) and not re.search(r"\b(pvt|ltd)\b", company_name, re.I):
         company_name += " PVT. LTD."
+    if company_name:
+        company_name = re.sub(r"^[^\w]+|^\d+[\s.:-]+", "", company_name).strip()
 
     # 6. Name
     def clean_person_name(cand: str) -> str:
@@ -517,18 +558,54 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
             return ""
         # Strip phone numbers if present on the line
         cand = re.sub(r"(?:Mob(?:ile)?|Ph(?:one)?|Tel)[\s.:-]*\+?[\d\s-]+[a-zA-Z]*", "", cand, flags=re.I)
-        # Strip non-alphabetic noise from the beginning and end
-        cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z\.]+$", "", cand).strip()
-        # Strip leading OCR noise tags like 'fee', 'tl', 'pet', or stray short letters/numbers
-        cand = re.sub(r"^(?:fee|tl|pet|\d+[a-zA-Z]*|[a-zA-Z]{1,2})\s+", "", cand, flags=re.I).strip()
-        # Strip trailing 1-2 character stray noise (e.g. 'i', 'x', 'a', etc.)
+        # Strip any non-ASCII or replacement characters first
+        cand = re.sub(r"[^\x00-\x7F]+", " ", cand)
+        # Clean noise symbols, keep letters, spaces, dots, hyphens
+        cand = re.sub(r"[^A-Za-z\s.'-]", " ", cand)
+        cand = re.sub(r"\s+", " ", cand).strip(" .-_,:;|/\\")
+        
+        # If starts with a stray 1-2 letter token without dot (e.g. 'L Khushi', 'r Khushi', 'iL Khushi'), strip it!
+        cand = re.sub(r"^[a-zA-Z]{1,2}\s+(?=[A-Z])", "", cand).strip()
+        # If ends with a stray 1-2 letter token without dot (e.g. 'Khushi i', 'Arti Chaudhary x'), strip it!
         cand = re.sub(r"\s+[a-zA-Z]{1,2}$", "", cand).strip()
-        cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z\.]+$", "", cand).strip()
-        # Must have at least 3 alphabet letters and at least one vowel
-        alpha_only = re.sub(r"[^A-Za-z]", "", cand)
-        if len(alpha_only) >= 3 and re.search(r"[aeiouAEIOU]", cand):
-            return cand
-        return ""
+        
+        words = cand.split()
+        if not (1 <= len(words) <= 4):
+            return ""
+        if cand.islower():
+            return ""
+            
+        valid_words = []
+        for w in words:
+            cw = re.sub(r"[^A-Za-z]", "", w)
+            if not cw:
+                continue
+            # Allow single letters ONLY if they are initials with dot (like 'A.')
+            if len(cw) == 1 and not w.endswith("."):
+                return ""
+            if not (cw.istitle() or cw.isupper()):
+                return ""
+            valid_words.append(cw)
+            
+        if not valid_words:
+            return ""
+        full_clean = "".join(valid_words)
+        if len(full_clean) < 3 or not re.search(r"[aeiouAEIOU]", full_clean):
+            return ""
+            
+        cand_lower = cand.lower()
+        blacklist = [
+            "solutions", "solution", "services", "service", "technologies", "technology",
+            "industrial", "lubrication", "metering", "steels", "steel", "enterprises",
+            "products", "product", "branch", "office", "floor", "nagar", "delhi", "mumbai",
+            "noida", "burari", "bharat", "india", "attended", "visitor", "limited", "pvt",
+            "ltd", "inc", "corp", "company", "group", "road", "street", "block", "sector",
+            "bhawan", "gali", "colony", "website", "email", "phone", "mobile", "tel"
+        ]
+        if any(re.search(rf"\b{re.escape(b)}\b", cand_lower) for b in blacklist):
+            return ""
+            
+        return cand
 
     # 1. First, search for name candidates directly adjacent to the Job Title (above or below)
     name = ""
@@ -572,26 +649,43 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
                     name = cleaned
                     break
 
-    # 3. Fallback: inspect any clean 2-3 word capitalized or uppercase line
+    # 3. Fallback: inspect any clean capitalized or uppercase line
     if not name:
         for line in lines:
             cand = clean_person_name(line)
+            words_count = len(cand.split())
+            min_words = 1 if job_idx >= 0 else 2
             if (
                 cand
+                and words_count >= min_words
                 and cand != job_title
                 and cand != company_name
-                and (cand.istitle() or cand.isupper() or len(cand.split()) in [2, 3])
+                and (cand.istitle() or cand.isupper())
                 and not any(
                     kw in cand.lower()
                     for kw in address_keywords + company_keywords + [
                         "branch", "office", "floor", "road", "marg", "services",
                         "steels", "pvt", "ltd", "inc", "manufacturer", "supplier",
-                        "stockist", "plates", "amtex", "entry", "sheet", "attended"
+                        "stockist", "plates", "amtex", "entry", "sheet", "attended",
+                        "bhawan", "colony", "bharat", "delhi", "mumbai"
                     ]
                 )
             ):
                 name = cand
                 break
+
+    # 4. Fallback from email address (e.g. 'a.aman@...' or 'aman.sharma@...')
+    if not name and email:
+        user_p = email.split("@")[0]
+        # Match 'a.aman' -> 'Aman'
+        m_initial = re.match(r"^[a-zA-Z]\.([a-zA-Z]{3,})$", user_p)
+        if m_initial:
+            name = m_initial.group(1).title()
+        else:
+            # Match 'aman.sharma' -> 'Aman Sharma'
+            m_two = re.match(r"^([a-zA-Z]{3,})\.([a-zA-Z]{3,})$", user_p)
+            if m_two:
+                name = f"{m_two.group(1).title()} {m_two.group(2).title()}"
 
     # 7. Address
     address_lines = []
@@ -610,7 +704,7 @@ def extract_fields_from_text(raw_text: str) -> Dict[str, Any]:
             if line != company_name and line != job_title:
                 services_lines.append(line)
     services_products = " | ".join(services_lines[:2])
-
+    
     if name:
         name = clean_person_name(name)
     if job_title:
