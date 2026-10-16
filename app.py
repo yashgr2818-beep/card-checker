@@ -85,18 +85,36 @@ def get_settings() -> Dict[str, Any]:
         "database_url": os.environ.get("DATABASE_URL", ""),
         "engine_preference": "hybrid",  # "hybrid", "gemini", "tesseract"
     }
+
+    # Always check .env directly for fresh changes on disk
+    env_path = os.path.join(BASE_DIR, ".env")
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as ef:
+                for line in ef:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k == "GEMINI_API_KEY" and v:
+                        default_settings["gemini_api_key"] = v
+                    elif k == "DATABASE_URL" and v:
+                        default_settings["database_url"] = v
+        except Exception:
+            pass
+
     if os.path.isfile(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                default_settings.update(data)
+                for k, v in data.items():
+                    if v:
+                        default_settings[k] = v
+                    elif k not in default_settings:
+                        default_settings[k] = v
         except Exception:
             pass
-    # Env var always overrides empty key
-    if not default_settings["gemini_api_key"] and os.environ.get("GEMINI_API_KEY"):
-        default_settings["gemini_api_key"] = os.environ.get("GEMINI_API_KEY")
-    if not default_settings["database_url"] and os.environ.get("DATABASE_URL"):
-        default_settings["database_url"] = os.environ.get("DATABASE_URL")
     return default_settings
 
 
@@ -434,8 +452,13 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
         img_for_api = image.copy()
         img_for_api.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
-        # Primary current models: gemini-2.5-flash and gemini-2.0-flash are fast and accurate
-        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        # Active current models in priority order
+        models_to_try = [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
+            "gemini-flash-latest",
+            "gemini-2.5-flash",
+        ]
         last_error = None
 
         for model_name in models_to_try:
@@ -467,6 +490,54 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
         return None
 
     return None
+
+
+_GEMINI_KEY_CACHE = {"key": "", "valid": False, "status": "unconfigured", "message": ""}
+
+
+def test_gemini_api_key(api_key: str, force: bool = False) -> Dict[str, Any]:
+    """Tests if a Gemini API key is genuinely valid by contacting Google."""
+    global _GEMINI_KEY_CACHE
+    key = (api_key or "").strip()
+    if not key:
+        return {"valid": False, "status": "unconfigured", "message": "No API key configured."}
+    if not GENAI_AVAILABLE:
+        return {"valid": False, "status": "invalid", "message": "google-genai SDK not installed."}
+
+    if not force and _GEMINI_KEY_CACHE["key"] == key:
+        return {
+            "valid": _GEMINI_KEY_CACHE["valid"],
+            "status": _GEMINI_KEY_CACHE["status"],
+            "message": _GEMINI_KEY_CACHE["message"],
+        }
+
+    try:
+        client = genai.Client(api_key=key)
+        for m in ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"]:
+            try:
+                resp = client.models.generate_content(model=m, contents="ping")
+                if resp and resp.text:
+                    res = {"valid": True, "status": "active", "message": f"Connected ({m})"}
+                    _GEMINI_KEY_CACHE = {"key": key, **res}
+                    return res
+            except Exception as m_err:
+                err_str = str(m_err)
+                if "400" in err_str or "API_KEY_INVALID" in err_str or "API key not valid" in err_str:
+                    res = {"valid": False, "status": "invalid", "message": "Google rejected key: Invalid API Key."}
+                    _GEMINI_KEY_CACHE = {"key": key, **res}
+                    return res
+                if "403" in err_str or "PERMISSION_DENIED" in err_str:
+                    res = {"valid": False, "status": "invalid", "message": "Google rejected key: Quota / Permission Denied."}
+                    _GEMINI_KEY_CACHE = {"key": key, **res}
+                    return res
+                continue
+        res = {"valid": False, "status": "invalid", "message": "Could not connect to any Gemini model."}
+        _GEMINI_KEY_CACHE = {"key": key, **res}
+        return res
+    except Exception as e:
+        res = {"valid": False, "status": "invalid", "message": f"Connection error: {e}"}
+        _GEMINI_KEY_CACHE = {"key": key, **res}
+        return res
 
 
 def run_robust_local_ocr(image: Image.Image) -> str:
@@ -1036,6 +1107,7 @@ def process_card_image(image: Image.Image) -> Dict[str, Any]:
     raw_text = run_robust_local_ocr(image)
     ocr_data = extract_fields_from_text(raw_text)
     ocr_data["raw_text"] = raw_text
+    ocr_data["ocr_engine"] = "Local OCR (Tesseract)"
     return ocr_data
 
 
@@ -1309,14 +1381,30 @@ def api_get_stats():
     })
 
 
+@app.route("/api/settings/verify-key", methods=["POST"])
+def api_verify_key():
+    """Live verification of Gemini API key with Google servers."""
+    data = request.json or {}
+    key = data.get("gemini_api_key", "").strip()
+    if not key:
+        settings = get_settings()
+        key = settings.get("gemini_api_key", "").strip()
+    test_res = test_gemini_api_key(key, force=True)
+    return jsonify(test_res)
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     """Get or save API key, database URL, and engine preferences."""
     if request.method == "POST":
         data = request.json or {}
         settings = get_settings()
+        key_changed = False
         if "gemini_api_key" in data:
-            settings["gemini_api_key"] = data["gemini_api_key"].strip()
+            new_key = data["gemini_api_key"].strip()
+            if new_key != settings.get("gemini_api_key"):
+                key_changed = True
+            settings["gemini_api_key"] = new_key
         if "database_url" in data:
             settings["database_url"] = data["database_url"].strip()
         if "engine_preference" in data:
@@ -1326,13 +1414,24 @@ def api_settings():
             init_db()
         except Exception:
             pass
-        return jsonify({"success": True, "message": "Settings saved."})
+
+        warning_msg = None
+        if key_changed and settings.get("gemini_api_key"):
+            t_res = test_gemini_api_key(settings["gemini_api_key"], force=True)
+            if not t_res.get("valid"):
+                warning_msg = f"Saved, but warning: {t_res.get('message')} (The app will fall back to Local OCR until a valid key is provided)."
+            else:
+                warning_msg = f"Settings saved! Gemini API key verified: {t_res.get('message')}"
+
+        return jsonify({"success": True, "message": warning_msg or "Settings saved."})
 
     settings = get_settings()
     masked_key = ""
-    if settings.get("gemini_api_key"):
-        raw = settings["gemini_api_key"]
-        masked_key = raw[:4] + "..." + raw[-4:] if len(raw) > 8 else "***"
+    api_key = settings.get("gemini_api_key", "").strip()
+    if api_key:
+        masked_key = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
+
+    key_test = test_gemini_api_key(api_key) if api_key else {"valid": False, "status": "unconfigured", "message": "No key"}
 
     db_url = get_database_url()
     masked_db = ""
@@ -1340,7 +1439,10 @@ def api_settings():
         masked_db = db_url[:15] + "..." + db_url[-8:] if len(db_url) > 25 else "***"
 
     return jsonify({
-        "has_api_key": bool(settings.get("gemini_api_key")),
+        "has_api_key": bool(api_key),
+        "is_gemini_valid": key_test.get("valid", False),
+        "gemini_status": key_test.get("status", "unconfigured"),
+        "gemini_message": key_test.get("message", ""),
         "masked_api_key": masked_key,
         "has_database_url": bool(db_url),
         "masked_database_url": masked_db,
@@ -1652,12 +1754,25 @@ FRONTEND_HTML = """
             color: #166534;
             border-color: #bbf7d0;
         }
+        .engine-pill.invalid {
+            background: #fef2f2;
+            color: #991b1b;
+            border-color: #fecaca;
+        }
         .engine-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
             background: #10b981;
             box-shadow: 0 0 8px #10b981;
+        }
+        .engine-pill.tesseract .engine-dot {
+            background: #16a34a;
+            box-shadow: 0 0 8px #16a34a;
+        }
+        .engine-pill.invalid .engine-dot {
+            background: #dc2626;
+            box-shadow: 0 0 8px #dc2626;
         }
 
         /* CONTAINER */
@@ -2278,9 +2393,13 @@ FRONTEND_HTML = """
 
                 <div class="form-group" style="margin-bottom: 20px;">
                     <label>Gemini API Key</label>
-                    <input type="password" id="geminiApiKeyInput" placeholder="AIzaSy...">
-                    <small style="color:var(--text-muted); margin-top:4px;">
-                        Get a free Gemini API key at <a href="https://aistudio.google.com" target="_blank" style="color:var(--primary);">Google AI Studio</a>. When present, cards are parsed with Vision AI.
+                    <div style="display: flex; gap: 8px;">
+                        <input type="password" id="geminiApiKeyInput" placeholder="AIzaSy..." style="flex: 1;">
+                        <button type="button" class="btn btn-secondary" onclick="testApiKey()" style="white-space: nowrap; padding: 8px 14px; font-size: 13px;">🧪 Test Key</button>
+                    </div>
+                    <div id="keyTestResult" style="margin-top: 6px; font-size: 12px; font-weight: 600;"></div>
+                    <small style="color:var(--text-muted); margin-top:4px; display:block;">
+                        Get a free Gemini API key at <a href="https://aistudio.google.com" target="_blank" style="color:var(--primary);">Google AI Studio</a>. When verified, cards are parsed with Vision AI (Gemini 3.8 Flash).
                     </small>
                 </div>
 
@@ -2795,12 +2914,19 @@ FRONTEND_HTML = """
                 const pill = document.getElementById('engineStatusPill');
                 const text = document.getElementById('engineStatusText');
 
-                if (data.has_api_key) {
-                    text.textContent = 'Vision AI Active (99%+ Accuracy)';
+                if (data.gemini_status === 'active') {
+                    text.textContent = 'Vision AI Active (' + (data.gemini_message || '99%+ Accuracy') + ')';
                     pill.className = 'engine-pill';
+                } else if (data.gemini_status === 'invalid') {
+                    text.textContent = '⚠️ Invalid Gemini Key (Fallback to Local OCR)';
+                    pill.className = 'engine-pill invalid';
                 } else {
                     text.textContent = 'Local Tesseract OCR';
                     pill.className = 'engine-pill tesseract';
+                }
+
+                if (data.masked_api_key) {
+                    document.getElementById('geminiApiKeyInput').placeholder = 'Configured: ' + data.masked_api_key;
                 }
 
                 const dbText = document.getElementById('dbStatusText');
@@ -2838,6 +2964,32 @@ FRONTEND_HTML = """
                 }
             } catch (err) {
                 console.error(err);
+            }
+        }
+
+        async function testApiKey() {
+            const key = document.getElementById('geminiApiKeyInput').value.trim();
+            const resEl = document.getElementById('keyTestResult');
+            resEl.style.color = '#64748b';
+            resEl.textContent = '⏳ Verifying connection with Google Gemini...';
+            try {
+                const resp = await fetch('/api/settings/verify-key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gemini_api_key: key })
+                });
+                const res = await resp.json();
+                if (res.valid) {
+                    resEl.style.color = '#16a34a';
+                    resEl.textContent = '✅ ' + res.message;
+                } else {
+                    resEl.style.color = '#dc2626';
+                    resEl.textContent = '❌ ' + res.message;
+                }
+                loadSettings();
+            } catch (err) {
+                resEl.style.color = '#dc2626';
+                resEl.textContent = '❌ Verification error: ' + err.message;
             }
         }
 
