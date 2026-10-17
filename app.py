@@ -23,7 +23,7 @@ from flask import (
     send_file,
     send_from_directory,
 )
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from PIL import Image, ImageOps
 import pytesseract
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -125,7 +125,7 @@ def save_settings(settings: Dict[str, Any]):
 
 
 # ==========================================
-# 2. DATABASE MANAGEMENT (NEON POSTGRESQL & SQLITE)
+# 2. DATABASE MANAGEMENT (NEON CLOUD POSTGRESQL)
 # ==========================================
 
 def get_database_url() -> str:
@@ -136,10 +136,6 @@ def get_database_url() -> str:
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     return db_url
-
-
-def is_postgres_active() -> bool:
-    return True
 
 
 _PG_POOL = None
@@ -1278,7 +1274,7 @@ def api_get_contacts():
 
 @app.route("/api/contacts", methods=["POST"])
 def api_create_contact():
-    """Save a new contact in SQLite database."""
+    """Save a new contact in Neon PostgreSQL database."""
     data = request.json or {}
     if not data.get("name"):
         return jsonify({"error": "Name is required."}), 400
@@ -1510,7 +1506,6 @@ def api_settings():
         "engine_preference": settings.get("engine_preference", "hybrid"),
         "genai_sdk_installed": GENAI_AVAILABLE,
         "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
-        "is_postgres": True,
         "db_engine": "Neon Cloud PostgreSQL (Active)",
     })
 
@@ -2995,8 +2990,8 @@ FRONTEND_HTML = """
 
                 const dbText = document.getElementById('dbStatusText');
                 if (dbText) {
-                    dbText.textContent = data.db_engine || 'Local SQLite Database';
-                    dbText.style.color = data.is_postgres ? '#16a34a' : '#1e293b';
+                    dbText.textContent = data.db_engine || 'Neon Cloud PostgreSQL (Active)';
+                    dbText.style.color = '#16a34a';
                 }
 
                 if (data.masked_database_url) {
