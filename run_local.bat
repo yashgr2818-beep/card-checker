@@ -58,7 +58,13 @@ if %TESS_FOUND% equ 1 (
 )
 echo.
 
-:: 4. Start the application
+:: 4. Free port 5000 if an old instance is still running
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr /r ":5000.*LISTENING"') do (
+    echo [INFO] Stopping old server instance (PID: %%a) to load fresh updates...
+    taskkill /F /PID %%a >nul 2>nul
+)
+
+:: 5. Start the application
 echo [3/3] Launching web application...
 echo Server starting at http://127.0.0.1:5000
 echo Your default web browser will open automatically.

@@ -3134,9 +3134,20 @@ if __name__ == "__main__":
     # Local development: automatically open the browser directly
     if not os.environ.get("RENDER"):
         import webbrowser
-        def open_local_browser():
-            webbrowser.open(f"http://127.0.0.1:{port}")
-        threading.Timer(1.2, open_local_browser).start()
+        def open_local_browser(target_port):
+            webbrowser.open(f"http://127.0.0.1:{target_port}")
+        threading.Timer(1.2, lambda: open_local_browser(port)).start()
         print(f"\n[Card Scanner] Running locally at http://127.0.0.1:{port} (Opening browser automatically...)\n")
 
-    app.run(host="0.0.0.0", port=port, debug=False)
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False)
+    except OSError as e:
+        if "10048" in str(e) or "Address already in use" in str(e):
+            alt_port = port + 1
+            print(f"\n[Notice] Port {port} is occupied. Automatically switching to http://127.0.0.1:{alt_port}...\n")
+            if not os.environ.get("RENDER"):
+                import webbrowser
+                webbrowser.open(f"http://127.0.0.1:{alt_port}")
+            app.run(host="0.0.0.0", port=alt_port, debug=False)
+        else:
+            raise
