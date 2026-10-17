@@ -5,7 +5,6 @@ import csv
 import json
 import time
 import threading
-import sqlite3
 import shutil
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -56,7 +55,6 @@ except Exception:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
-DB_PATH = os.path.join(DATA_DIR, "cards.db")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -141,7 +139,7 @@ def get_database_url() -> str:
 
 
 def is_postgres_active() -> bool:
-    return bool(get_database_url() and PSYCOPG2_AVAILABLE)
+    return True
 
 
 _PG_POOL = None
@@ -159,7 +157,7 @@ def get_pg_pool(url: str):
                     _PG_POOL.closeall()
                 except Exception:
                     pass
-            _PG_POOL = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=url, connect_timeout=6)
+            _PG_POOL = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=url, connect_timeout=8)
             _PG_POOL_URL = url
         return _PG_POOL
 
@@ -177,13 +175,12 @@ def reset_pg_pool():
 
 
 class UniversalCursor:
-    """Wrapper that normalizes SQL placeholders and dict outputs across SQLite & Postgres."""
-    def __init__(self, cursor, is_postgres: bool):
+    """PostgreSQL cursor wrapper supporting both %s and ? placeholders with dict output."""
+    def __init__(self, cursor):
         self._cursor = cursor
-        self.is_postgres = is_postgres
 
     def execute(self, sql: str, params=None):
-        if self.is_postgres:
+        if "?" in sql:
             sql = sql.replace("?", "%s")
         if params is not None:
             return self._cursor.execute(sql, tuple(params) if isinstance(params, list) else params)
@@ -191,9 +188,7 @@ class UniversalCursor:
 
     def fetchone(self) -> Optional[Dict[str, Any]]:
         row = self._cursor.fetchone()
-        if row is None:
-            return None
-        return dict(row)
+        return dict(row) if row is not None else None
 
     def fetchall(self) -> List[Dict[str, Any]]:
         rows = self._cursor.fetchall()
@@ -211,24 +206,20 @@ class UniversalCursor:
 
 
 class DBConnection:
-    """Universal connection wrapper supporting pooled Neon connections & local SQLite."""
-    def __init__(self, raw_conn, is_postgres: bool, pool_instance=None):
+    """PostgreSQL pooled connection wrapper with automatic return on close."""
+    def __init__(self, raw_conn, pool_instance=None):
         self._conn = raw_conn
-        self.is_postgres = is_postgres
         self._pool_instance = pool_instance
 
     def cursor(self) -> UniversalCursor:
-        if self.is_postgres:
-            raw_cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        else:
-            raw_cur = self._conn.cursor()
-        return UniversalCursor(raw_cur, self.is_postgres)
+        raw_cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        return UniversalCursor(raw_cur)
 
     def commit(self):
         self._conn.commit()
 
     def close(self):
-        if self._pool_instance and self.is_postgres:
+        if self._pool_instance:
             try:
                 self._pool_instance.putconn(self._conn)
             except Exception:
@@ -241,189 +232,67 @@ class DBConnection:
 
 
 def get_db() -> DBConnection:
-    """Get database connection: Reusable Neon Cloud PostgreSQL pool if available, else local SQLite."""
-    if is_postgres_active():
-        url = get_database_url()
-        try:
+    """Returns pooled connection to Neon Cloud PostgreSQL."""
+    url = get_database_url()
+    try:
+        p = get_pg_pool(url)
+        conn = p.getconn()
+        if conn.closed != 0:
+            reset_pg_pool()
             p = get_pg_pool(url)
             conn = p.getconn()
-            if conn.closed != 0:
-                reset_pg_pool()
-                p = get_pg_pool(url)
-                conn = p.getconn()
-            return DBConnection(conn, True, pool_instance=p)
-        except Exception as err:
-            reset_pg_pool()
-            try:
-                raw_conn = psycopg2.connect(url, connect_timeout=5)
-                return DBConnection(raw_conn, True)
-            except Exception as direct_err:
-                print(f"[DB Warning] Could not connect to Neon PostgreSQL ({direct_err}). Falling back to SQLite.")
-
-    raw_conn = sqlite3.connect(DB_PATH)
-    raw_conn.row_factory = sqlite3.Row
-    return DBConnection(raw_conn, False)
+        return DBConnection(conn, pool_instance=p)
+    except Exception as err:
+        reset_pg_pool()
+        raw_conn = psycopg2.connect(url, connect_timeout=5)
+        return DBConnection(raw_conn)
 
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    if conn.is_postgres:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contacts (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                job_title TEXT,
-                company_name TEXT,
-                email TEXT,
-                phone_number TEXT,
-                website TEXT,
-                address TEXT,
-                services_products TEXT,
-                notes TEXT,
-                lead_status TEXT DEFAULT 'New',
-                tags TEXT,
-                image_filename TEXT,
-                ocr_engine TEXT,
-                raw_text TEXT,
-                created_at TEXT,
-                follow_up_date TEXT
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS corrections_memory (
-                id SERIAL PRIMARY KEY,
-                field_name TEXT NOT NULL,
-                wrong_value TEXT,
-                corrected_value TEXT NOT NULL,
-                raw_text_snippet TEXT,
-                created_at TEXT
-            )
-            """
-        )
-    else:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                job_title TEXT,
-                company_name TEXT,
-                email TEXT,
-                phone_number TEXT,
-                website TEXT,
-                address TEXT,
-                services_products TEXT,
-                notes TEXT,
-                lead_status TEXT DEFAULT 'New',
-                tags TEXT,
-                image_filename TEXT,
-                ocr_engine TEXT,
-                raw_text TEXT,
-                created_at TEXT,
-                follow_up_date TEXT
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS corrections_memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                field_name TEXT NOT NULL,
-                wrong_value TEXT,
-                corrected_value TEXT NOT NULL,
-                raw_text_snippet TEXT,
-                created_at TEXT
-            )
-            """
-        )
 _DB_INITIALIZED = False
 
 
 def init_db():
+    """Create PostgreSQL tables and performance indexes once."""
     global _DB_INITIALIZED
     if _DB_INITIALIZED:
         return
     try:
         conn = get_db()
         c = conn.cursor()
-        if conn.is_postgres:
-            c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    job_title TEXT,
-                    company_name TEXT,
-                    email TEXT,
-                    phone_number TEXT,
-                    website TEXT,
-                    address TEXT,
-                    services_products TEXT,
-                    notes TEXT,
-                    lead_status TEXT DEFAULT 'New',
-                    tags TEXT,
-                    image_filename TEXT,
-                    ocr_engine TEXT,
-                    raw_text TEXT,
-                    created_at TEXT,
-                    follow_up_date TEXT
-                );
-                CREATE TABLE IF NOT EXISTS corrections_memory (
-                    id SERIAL PRIMARY KEY,
-                    field_name TEXT NOT NULL,
-                    wrong_value TEXT,
-                    corrected_value TEXT NOT NULL,
-                    raw_text_snippet TEXT,
-                    created_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_contacts_lead_status ON contacts(lead_status);
-                CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections_memory(field_name, wrong_value);
-                """
-            )
-        else:
-            c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    job_title TEXT,
-                    company_name TEXT,
-                    email TEXT,
-                    phone_number TEXT,
-                    website TEXT,
-                    address TEXT,
-                    services_products TEXT,
-                    notes TEXT,
-                    lead_status TEXT DEFAULT 'New',
-                    tags TEXT,
-                    image_filename TEXT,
-                    ocr_engine TEXT,
-                    raw_text TEXT,
-                    created_at TEXT,
-                    follow_up_date TEXT
-                );
-                """
-            )
-            c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS corrections_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    field_name TEXT NOT NULL,
-                    wrong_value TEXT,
-                    corrected_value TEXT NOT NULL,
-                    raw_text_snippet TEXT,
-                    created_at TEXT
-                );
-                """
-            )
-            c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_lead_status ON contacts(lead_status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(created_at DESC);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections_memory(field_name, wrong_value);")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                job_title TEXT,
+                company_name TEXT,
+                email TEXT,
+                phone_number TEXT,
+                website TEXT,
+                address TEXT,
+                services_products TEXT,
+                notes TEXT,
+                lead_status TEXT DEFAULT 'New',
+                tags TEXT,
+                image_filename TEXT,
+                ocr_engine TEXT,
+                raw_text TEXT,
+                created_at TEXT,
+                follow_up_date TEXT
+            );
+            CREATE TABLE IF NOT EXISTS corrections_memory (
+                id SERIAL PRIMARY KEY,
+                field_name TEXT NOT NULL,
+                wrong_value TEXT,
+                corrected_value TEXT NOT NULL,
+                raw_text_snippet TEXT,
+                created_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_contacts_lead_status ON contacts(lead_status);
+            CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections_memory(field_name, wrong_value);
+            """
+        )
         conn.commit()
         conn.close()
         _DB_INITIALIZED = True
@@ -1442,14 +1311,10 @@ def api_create_contact():
         now,
         data.get("follow_up_date", "").strip(),
     )
-    if conn.is_postgres:
-        query += " RETURNING id"
-        c.execute(query, params)
-        res = c.fetchone()
-        new_id = res["id"] if res else 1
-    else:
-        c.execute(query, params)
-        new_id = c.lastrowid
+    query += " RETURNING id"
+    c.execute(query, params)
+    res = c.fetchone()
+    new_id = res["id"] if res else 1
     conn.commit()
     conn.close()
 
@@ -1645,8 +1510,8 @@ def api_settings():
         "engine_preference": settings.get("engine_preference", "hybrid"),
         "genai_sdk_installed": GENAI_AVAILABLE,
         "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
-        "is_postgres": is_postgres_active(),
-        "db_engine": "Neon Cloud PostgreSQL (Persistent)" if is_postgres_active() else "Local SQLite Database",
+        "is_postgres": True,
+        "db_engine": "Neon Cloud PostgreSQL (Active)",
     })
 
 
@@ -2610,13 +2475,13 @@ FRONTEND_HTML = """
 
                 <div class="form-group" style="margin-bottom: 24px; padding: 14px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;">
                     <label style="margin-bottom: 4px;">Database Storage</label>
-                    <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: #1e293b; margin-bottom: 8px;">
-                        <span>💾</span> <span id="dbStatusText">Local SQLite Database</span>
+                    <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; color: #16a34a; margin-bottom: 8px;">
+                        <span>💾</span> <span id="dbStatusText">Neon Cloud PostgreSQL (Active)</span>
                     </div>
-                    <label style="font-size: 12px; margin-top: 8px; display:block;">Neon PostgreSQL Connection URL (Sync Local & Cloud):</label>
+                    <label style="font-size: 12px; margin-top: 8px; display:block;">Neon PostgreSQL Connection URL:</label>
                     <input type="password" id="databaseUrlInput" placeholder="postgresql://user:password@ep-xyz.neon.tech/neondb?sslmode=require" style="margin-top:4px;">
                     <small style="color:var(--text-muted); display:block; margin-top:4px;">
-                        Set here or via <code>DATABASE_URL</code> in Render to sync with <a href="https://neon.tech" target="_blank" style="color:var(--primary);">Neon.tech PostgreSQL</a>. Leave blank to use local SQLite.
+                        Configured via <code>DATABASE_URL</code> in <code>.env</code> or settings.
                     </small>
                 </div>
 
