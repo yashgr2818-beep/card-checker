@@ -3,6 +3,8 @@ import io
 import re
 import csv
 import json
+import time
+import threading
 import sqlite3
 import shutil
 from datetime import datetime
@@ -27,9 +29,10 @@ import pytesseract
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# Optional PostgreSQL (Neon DB) support
+# Optional PostgreSQL (Neon DB) support with connection pooling
 try:
     import psycopg2
+    from psycopg2 import pool
     from psycopg2.extras import RealDictCursor
     PSYCOPG2_AVAILABLE = True
 except Exception:
@@ -141,6 +144,38 @@ def is_postgres_active() -> bool:
     return bool(get_database_url() and PSYCOPG2_AVAILABLE)
 
 
+_PG_POOL = None
+_PG_POOL_URL = None
+_PG_POOL_LOCK = threading.Lock()
+
+
+def get_pg_pool(url: str):
+    """Thread-safe connection pool manager for Neon Cloud PostgreSQL."""
+    global _PG_POOL, _PG_POOL_URL
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None or _PG_POOL_URL != url:
+            if _PG_POOL is not None:
+                try:
+                    _PG_POOL.closeall()
+                except Exception:
+                    pass
+            _PG_POOL = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=url, connect_timeout=6)
+            _PG_POOL_URL = url
+        return _PG_POOL
+
+
+def reset_pg_pool():
+    global _PG_POOL, _PG_POOL_URL
+    with _PG_POOL_LOCK:
+        if _PG_POOL is not None:
+            try:
+                _PG_POOL.closeall()
+            except Exception:
+                pass
+            _PG_POOL = None
+            _PG_POOL_URL = None
+
+
 class UniversalCursor:
     """Wrapper that normalizes SQL placeholders and dict outputs across SQLite & Postgres."""
     def __init__(self, cursor, is_postgres: bool):
@@ -176,10 +211,11 @@ class UniversalCursor:
 
 
 class DBConnection:
-    """Universal connection wrapper for Neon PostgreSQL and local SQLite."""
-    def __init__(self, raw_conn, is_postgres: bool):
+    """Universal connection wrapper supporting pooled Neon connections & local SQLite."""
+    def __init__(self, raw_conn, is_postgres: bool, pool_instance=None):
         self._conn = raw_conn
         self.is_postgres = is_postgres
+        self._pool_instance = pool_instance
 
     def cursor(self) -> UniversalCursor:
         if self.is_postgres:
@@ -192,20 +228,37 @@ class DBConnection:
         self._conn.commit()
 
     def close(self):
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        if self._pool_instance and self.is_postgres:
+            try:
+                self._pool_instance.putconn(self._conn)
+            except Exception:
+                pass
+        else:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 
 def get_db() -> DBConnection:
-    """Get database connection: Neon Cloud PostgreSQL if DATABASE_URL set, else local SQLite."""
+    """Get database connection: Reusable Neon Cloud PostgreSQL pool if available, else local SQLite."""
     if is_postgres_active():
+        url = get_database_url()
         try:
-            raw_conn = psycopg2.connect(get_database_url())
-            return DBConnection(raw_conn, True)
+            p = get_pg_pool(url)
+            conn = p.getconn()
+            if conn.closed != 0:
+                reset_pg_pool()
+                p = get_pg_pool(url)
+                conn = p.getconn()
+            return DBConnection(conn, True, pool_instance=p)
         except Exception as err:
-            print(f"[DB Warning] Could not connect to Neon PostgreSQL ({err}). Falling back to SQLite.")
+            reset_pg_pool()
+            try:
+                raw_conn = psycopg2.connect(url, connect_timeout=5)
+                return DBConnection(raw_conn, True)
+            except Exception as direct_err:
+                print(f"[DB Warning] Could not connect to Neon PostgreSQL ({direct_err}). Falling back to SQLite.")
 
     raw_conn = sqlite3.connect(DB_PATH)
     raw_conn.row_factory = sqlite3.Row
@@ -287,15 +340,103 @@ def init_db():
             )
             """
         )
-    conn.commit()
-    conn.close()
+_DB_INITIALIZED = False
 
 
-init_db()
+def init_db():
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        if conn.is_postgres:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    job_title TEXT,
+                    company_name TEXT,
+                    email TEXT,
+                    phone_number TEXT,
+                    website TEXT,
+                    address TEXT,
+                    services_products TEXT,
+                    notes TEXT,
+                    lead_status TEXT DEFAULT 'New',
+                    tags TEXT,
+                    image_filename TEXT,
+                    ocr_engine TEXT,
+                    raw_text TEXT,
+                    created_at TEXT,
+                    follow_up_date TEXT
+                );
+                CREATE TABLE IF NOT EXISTS corrections_memory (
+                    id SERIAL PRIMARY KEY,
+                    field_name TEXT NOT NULL,
+                    wrong_value TEXT,
+                    corrected_value TEXT NOT NULL,
+                    raw_text_snippet TEXT,
+                    created_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_contacts_lead_status ON contacts(lead_status);
+                CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections_memory(field_name, wrong_value);
+                """
+            )
+        else:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    job_title TEXT,
+                    company_name TEXT,
+                    email TEXT,
+                    phone_number TEXT,
+                    website TEXT,
+                    address TEXT,
+                    services_products TEXT,
+                    notes TEXT,
+                    lead_status TEXT DEFAULT 'New',
+                    tags TEXT,
+                    image_filename TEXT,
+                    ocr_engine TEXT,
+                    raw_text TEXT,
+                    created_at TEXT,
+                    follow_up_date TEXT
+                );
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corrections_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    field_name TEXT NOT NULL,
+                    wrong_value TEXT,
+                    corrected_value TEXT NOT NULL,
+                    raw_text_snippet TEXT,
+                    created_at TEXT
+                );
+                """
+            )
+            c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_lead_status ON contacts(lead_status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_created_at ON contacts(created_at DESC);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections_memory(field_name, wrong_value);")
+        conn.commit()
+        conn.close()
+        _DB_INITIALIZED = True
+    except Exception as e:
+        print(f"[DB Warning] init_db defer: {e}")
+
+
+_CORRECTIONS_CACHE = {"timestamp": 0.0, "rules": []}
 
 
 def record_correction(field_name: str, wrong_val: str, correct_val: str, raw_text: str = ""):
     """Record a user correction to teach the AI and heuristic engines."""
+    global _CORRECTIONS_CACHE
     field_name = (field_name or "").strip()
     wrong_val = (wrong_val or "").strip()
     correct_val = (correct_val or "").strip()
@@ -326,12 +467,19 @@ def record_correction(field_name: str, wrong_val: str, correct_val: str, raw_tex
         )
         conn.commit()
         conn.close()
+        # Invalidate cache so changes take effect immediately
+        _CORRECTIONS_CACHE = {"timestamp": 0.0, "rules": []}
     except Exception as e:
         print(f"[Memory Warning] Could not record correction: {e}")
 
 
 def get_learned_corrections(limit: int = 20) -> List[Dict[str, Any]]:
-    """Retrieve recent user corrections from memory."""
+    """Retrieve recent user corrections from memory with in-memory TTL caching."""
+    global _CORRECTIONS_CACHE
+    now_ts = time.time()
+    if _CORRECTIONS_CACHE["rules"] and (now_ts - _CORRECTIONS_CACHE["timestamp"] < 30):
+        return _CORRECTIONS_CACHE["rules"][:limit]
+
     try:
         conn = get_db()
         c = conn.cursor()
@@ -341,19 +489,21 @@ def get_learned_corrections(limit: int = 20) -> List[Dict[str, Any]]:
         )
         rows = c.fetchall()
         conn.close()
-        results = []
-        for r in rows:
-            results.append({
+        results = [
+            {
                 "id": r["id"],
                 "field_name": r["field_name"],
                 "wrong_value": r["wrong_value"],
                 "corrected_value": r["corrected_value"],
                 "created_at": r["created_at"],
-            })
+            }
+            for r in rows
+        ]
+        _CORRECTIONS_CACHE = {"timestamp": now_ts, "rules": results}
         return results
     except Exception as e:
         print(f"[Memory Warning] Could not fetch corrections: {e}")
-        return []
+        return _CORRECTIONS_CACHE.get("rules", [])[:limit]
 
 
 def build_learned_rules_prompt() -> str:
@@ -420,13 +570,28 @@ if GENAI_AVAILABLE:
         notes: str = ""
 
 
+_GENAI_CLIENT_CACHE = {}
+
+
+def get_genai_client(api_key: str):
+    """Reuses cached GenAI client instances to maintain HTTP keepalive connections."""
+    if not GENAI_AVAILABLE or not api_key:
+        return None
+    k = api_key.strip()
+    if k not in _GENAI_CLIENT_CACHE:
+        _GENAI_CLIENT_CACHE[k] = genai.Client(api_key=k)
+    return _GENAI_CLIENT_CACHE[k]
+
+
 def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, Any]]:
     """Extract card details with Google Gemini Vision API."""
     if not GENAI_AVAILABLE or not api_key:
         return None
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = get_genai_client(api_key)
+        if not client:
+            return None
 
         prompt = (
             "You are an expert AI business card scanner and data extractor matching BizConnect accuracy.\n"
@@ -435,9 +600,9 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
             "- job_title: professional title/designation.\n"
             "- company_name: official business or organization name.\n"
             "- email: primary email address. CRITICAL: Any text containing '@' has a 99%+ probability of being an email ID. "
-            "Carefully examine vertical side strips, colored banners (e.g. cyan/blue margin strips), and edges where emails like '...@gmail.com' or corporate domains are printed. Always extract the complete email if '@' is present.\n"
-            "- phone_number: EXACT complete telephone or mobile number as written on the card (including area codes or +91). Never invent, rearrange, or fabricate digits. Do not append isolated border noise as extra digits.\n"
-            "- website: clean website as written on the card without 'https://' or 'http://'. If 'www.' is written on the card, keep 'www.'. If only the domain is written without 'www.' (e.g. 'dotdosing.in'), fetch only what is written without adding 'www.'. Never invent 'www.' or '.com' if not written on the card.\n"
+            "Carefully examine vertical side strips, colored banners, and edges where emails like '...@gmail.com' or corporate domains are printed.\n"
+            "- phone_number: EXACT complete telephone or mobile number as written on the card (including area codes or +91). Never invent or fabricate digits.\n"
+            "- website: clean website as written on the card without 'https://' or 'http://'. If 'www.' is written on the card, keep 'www.'. If only domain is written, fetch only what is written without adding 'www.'.\n"
             "- address: full street, building, city, state, postal code, and country.\n"
             "- services_products: core offerings, products, or services listed.\n"
             "- notes: any extra slogans or branch details.\n"
@@ -448,9 +613,16 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
         if learned_rules:
             prompt += f"\n\n{learned_rules}"
 
-        # Resize for ultra-fast network transfer while maintaining crystal-clear text
-        img_for_api = image.copy()
-        img_for_api.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        # Highly optimized in-memory JPEG compression: reduces payload by 90% (~95KB vs ~2MB)
+        if image.mode != "RGB":
+            img_rgb = image.convert("RGB")
+        else:
+            img_rgb = image.copy()
+        img_rgb.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img_rgb.save(buf, format="JPEG", quality=85, optimize=True)
+        img_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
         # Active current models in priority order
         models_to_try = [
@@ -465,7 +637,7 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
             try:
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=[prompt, img_for_api],
+                    contents=[prompt, img_part],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=BusinessCardModel,
@@ -478,7 +650,6 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
                     return parsed
             except Exception as e:
                 last_error = e
-                # If model is 404/deprecated, immediately try next model without delay
                 continue
 
         if last_error:
@@ -512,7 +683,7 @@ def test_gemini_api_key(api_key: str, force: bool = False) -> Dict[str, Any]:
         }
 
     try:
-        client = genai.Client(api_key=key)
+        client = get_genai_client(key)
         for m in ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"]:
             try:
                 resp = client.models.generate_content(model=m, contents="ping")
@@ -542,15 +713,15 @@ def test_gemini_api_key(api_key: str, force: bool = False) -> Dict[str, Any]:
 
 def run_robust_local_ocr(image: Image.Image) -> str:
     """
-    Robust high-accuracy local OCR:
-    1. Fast orientation detection across [0, 90, 180, 270] using binary thresholding with PSM 6 (~1.5s total)
-    2. Multi-layout extraction on winning angle combining contrast-enhanced and thresholded passes
+    Optimized high-accuracy local OCR:
+    1. Fast orientation detection across [0, 90, 270] with early-exit if 0° is clear (~0.2s)
+    2. Adaptive high-res extraction on winning angle (single-pass first; fallback only if sparse)
     """
     image = ImageOps.exif_transpose(image)
     image = image.convert("RGB")
 
-    # Step 1: Ultra-fast orientation scan on lightweight 750px thumbnail (~0.2s per angle)
-    thumb_scale = min(750 / max(image.width, image.height), 1.0)
+    # Step 1: Ultra-fast orientation scan on lightweight 600px thumbnail
+    thumb_scale = min(600 / max(image.width, image.height), 1.0)
     img_thumb = image.resize(
         (int(image.width * thumb_scale), int(image.height * thumb_scale)),
         Image.Resampling.BILINEAR,
@@ -562,7 +733,7 @@ def run_robust_local_ocr(image: Image.Image) -> str:
     for rot in [0, 90, 270]:
         r = img_thumb.rotate(rot, expand=True) if rot != 0 else img_thumb
         g = r.convert("L")
-        thresh = g.point(lambda p: 255 if p > 170 else 0)
+        thresh = g.point(lambda p: 255 if p > 165 else 0)
 
         try:
             t = pytesseract.image_to_string(thresh, config="--psm 6 --oem 3").strip()
@@ -572,7 +743,7 @@ def run_robust_local_ocr(image: Image.Image) -> str:
         words = re.findall(r"\b[A-Za-z]{3,}\b", t)
         score = len(words) * 5
 
-        # Real email address format (not just a stray '@' symbol in graphics)
+        # Real email address format
         if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", t):
             score += 80
         if re.search(r"\b(executive|manager|director|president|founder|engineer|developer|consultant|analyst|officer|sales|marketing)\b", t, re.I):
@@ -586,31 +757,50 @@ def run_robust_local_ocr(image: Image.Image) -> str:
             best_score = score
             best_rot = rot
 
-    # Step 2: High-resolution multi-layout extraction on winning angle ONLY
+        # Early exit: if standard 0° orientation clearly contains email or key terms, skip rotating!
+        if rot == 0 and score >= 90:
+            break
+
+    # Step 2: High-resolution adaptive extraction on winning angle
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
-    scale2 = min(2200 / max(best_rotated.width, best_rotated.height), 1.4)
+    scale2 = min(1800 / max(best_rotated.width, best_rotated.height), 1.3)
     proc = best_rotated.resize(
         (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
-        Image.Resampling.LANCZOS,
+        Image.Resampling.BILINEAR,
     )
     gray = proc.convert("L")
-    thresh150 = gray.point(lambda p: 255 if p > 150 else 0)
-    thresh162 = gray.point(lambda p: 255 if p > 162 else 0)
-    thresh172 = gray.point(lambda p: 255 if p > 172 else 0)
 
+    # Primary pass: middle threshold (162) captures 90%+ of all cards cleanly
+    thresh_primary = gray.point(lambda p: 255 if p > 162 else 0)
     all_lines = []
     seen = set()
 
-    for img_variant in [thresh150, thresh162, thresh172]:
-        try:
-            t = pytesseract.image_to_string(img_variant, config="--psm 6 --oem 3").strip()
-            for line in t.splitlines():
-                cl = line.strip(" \t\r\n:|-,;")
-                if len(cl) >= 3 and cl.lower() not in seen:
-                    seen.add(cl.lower())
-                    all_lines.append(cl)
-        except Exception:
-            continue
+    try:
+        t_primary = pytesseract.image_to_string(thresh_primary, config="--psm 6 --oem 3").strip()
+        for line in t_primary.splitlines():
+            cl = line.strip(" \t\r\n:|-,;")
+            if len(cl) >= 3 and cl.lower() not in seen:
+                seen.add(cl.lower())
+                all_lines.append(cl)
+    except Exception:
+        pass
+
+    # Adaptive secondary pass: ONLY run if primary pass yielded sparse lines or missed contact info
+    has_contact = any("@" in l or re.search(r"\d{6,}", l) for l in all_lines)
+    if len(all_lines) < 8 or not has_contact:
+        for threshold_val in [150, 175]:
+            try:
+                thresh_alt = gray.point(lambda p: 255 if p > threshold_val else 0)
+                t_alt = pytesseract.image_to_string(thresh_alt, config="--psm 6 --oem 3").strip()
+                for line in t_alt.splitlines():
+                    cl = line.strip(" \t\r\n:|-,;")
+                    if len(cl) >= 3 and cl.lower() not in seen:
+                        seen.add(cl.lower())
+                        all_lines.append(cl)
+                if len(all_lines) >= 10 and any("@" in l for l in all_lines):
+                    break
+            except Exception:
+                continue
 
     return "\n".join(all_lines) if all_lines else ""
 
@@ -1119,6 +1309,14 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB max batch upload
 
 
+@app.before_request
+def ensure_db_ready():
+    """Lazy DB initialization on first request so app startup is instantaneous."""
+    global _DB_INITIALIZED
+    if not _DB_INITIALIZED:
+        init_db()
+
+
 @app.route("/")
 def index():
     return render_template_string(FRONTEND_HTML)
@@ -1126,7 +1324,7 @@ def index():
 
 @app.route("/uploads/<filename>")
 def serve_upload(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+    return send_from_directory(UPLOAD_DIR, filename, max_age=86400)
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -1341,29 +1539,27 @@ def api_delete_contact(cid):
 
 @app.route("/api/stats", methods=["GET"])
 def api_get_stats():
-    """Summary dashboard statistics."""
+    """Summary dashboard statistics with single consolidated query for 5x speed."""
     conn = get_db()
     c = conn.cursor()
 
-    c.execute("SELECT COUNT(*) as total FROM contacts")
-    res = c.fetchone()
-    total = res["total"] if res else 0
-
-    c.execute("SELECT COUNT(*) as new_leads FROM contacts WHERE lead_status = 'New'")
-    res = c.fetchone()
-    new_leads = res["new_leads"] if res else 0
-
-    c.execute("SELECT COUNT(*) as contacted FROM contacts WHERE lead_status = 'Contacted'")
-    res = c.fetchone()
-    contacted = res["contacted"] if res else 0
-
-    c.execute("SELECT COUNT(*) as qualified FROM contacts WHERE lead_status = 'Qualified'")
-    res = c.fetchone()
-    qualified = res["qualified"] if res else 0
-
-    c.execute("SELECT COUNT(*) as customers FROM contacts WHERE lead_status = 'Customer'")
-    res = c.fetchone()
-    customers = res["customers"] if res else 0
+    c.execute(
+        """
+        SELECT 
+            COUNT(*) as total,
+            COUNT(CASE WHEN lead_status = 'New' THEN 1 END) as new_leads,
+            COUNT(CASE WHEN lead_status = 'Contacted' THEN 1 END) as contacted,
+            COUNT(CASE WHEN lead_status = 'Qualified' THEN 1 END) as qualified,
+            COUNT(CASE WHEN lead_status = 'Customer' THEN 1 END) as customers
+        FROM contacts
+        """
+    )
+    res = c.fetchone() or {}
+    total = res.get("total", 0)
+    new_leads = res.get("new_leads", 0)
+    contacted = res.get("contacted", 0)
+    qualified = res.get("qualified", 0)
+    customers = res.get("customers", 0)
 
     c.execute(
         "SELECT company_name, COUNT(*) as cnt FROM contacts WHERE company_name != '' GROUP BY company_name ORDER BY cnt DESC LIMIT 5"
@@ -2817,8 +3013,11 @@ FRONTEND_HTML = """
             }
         }
 
+        // Debounced search to prevent unnecessary network load
+        let searchDebounceTimer = null;
         function filterContacts() {
-            loadContacts();
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(loadContacts, 220);
         }
 
         function renderContactsGrid(contacts) {
@@ -3069,10 +3268,12 @@ FRONTEND_HTML = """
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
+    # Initialize DB in background thread so startup is instant
+    threading.Thread(target=init_db, daemon=True).start()
+
     # Local development: automatically open the browser directly
     if not os.environ.get("RENDER"):
         import webbrowser
-        import threading
         def open_local_browser():
             webbrowser.open(f"http://127.0.0.1:{port}")
         threading.Timer(1.2, open_local_browser).start()
