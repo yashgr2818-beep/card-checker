@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import re
 import csv
@@ -52,7 +53,10 @@ except Exception:
 # 1. SETUP & CONFIGURATION
 # ==========================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -2849,7 +2853,7 @@ FRONTEND_HTML = """
                 if (!resp.ok) throw new Error(res.error || 'Failed to save');
 
                 closeReviewModal();
-                loadStats();
+                loadStats(); 
                 loadContacts();
             } catch (err) {
                 alert('Error saving contact: ' + err.message);
@@ -3125,7 +3129,7 @@ FRONTEND_HTML = """
 </html>
 """
 
-if __name__ == "__main__":
+def main():
     port = int(os.environ.get("PORT", 5000))
 
     # Initialize DB in background thread so startup is instant
@@ -3151,3 +3155,6 @@ if __name__ == "__main__":
             app.run(host="0.0.0.0", port=alt_port, debug=False)
         else:
             raise
+
+if __name__ == "__main__":
+    main()
