@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import re
+import socket
 import csv
 import json
 import time
@@ -81,6 +82,63 @@ def find_tesseract_path():
 
 
 pytesseract.pytesseract.tesseract_cmd = find_tesseract_path()
+
+# ==========================================
+# Background Network Status Monitor
+# ==========================================
+NETWORK_STATE = {
+    "online": True,
+    "last_checked": 0,
+    "latency_ms": 0,
+}
+
+def check_internet(host="8.8.8.8", port=53, timeout=1.0) -> bool:
+    """Fast non-blocking socket probe to verify actual internet reachability."""
+    t0 = time.time()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        NETWORK_STATE["latency_ms"] = int((time.time() - t0) * 1000)
+        NETWORK_STATE["online"] = True
+        NETWORK_STATE["last_checked"] = time.time()
+        return True
+    except Exception:
+        # Fallback probe to Cloudflare DNS 1.1.1.1
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(("1.1.1.1", 53))
+            s.close()
+            NETWORK_STATE["latency_ms"] = int((time.time() - t0) * 1000)
+            NETWORK_STATE["online"] = True
+            NETWORK_STATE["last_checked"] = time.time()
+            return True
+        except Exception:
+            NETWORK_STATE["latency_ms"] = -1
+            NETWORK_STATE["online"] = False
+            NETWORK_STATE["last_checked"] = time.time()
+            return False
+
+def is_online() -> bool:
+    """Returns cached online status; refreshes if older than 5 seconds."""
+    if time.time() - NETWORK_STATE["last_checked"] > 5:
+        check_internet()
+    return NETWORK_STATE["online"]
+
+def _background_network_loop():
+    """Background daemon checking internet reachability every 5 seconds."""
+    while True:
+        try:
+            check_internet()
+        except Exception:
+            pass
+        time.sleep(5)
+
+# Launch network monitor background daemon immediately
+threading.Thread(target=_background_network_loop, daemon=True).start()
+
 
 
 # Load / Save Settings
@@ -1148,8 +1206,9 @@ def process_card_image(image: Image.Image) -> Dict[str, Any]:
     api_key = settings.get("gemini_api_key", "").strip()
     pref = settings.get("engine_preference", "hybrid")
 
-    # 1. Vision AI if configured and not explicitly set to local-only
-    if pref in ["hybrid", "gemini"] and api_key and GENAI_AVAILABLE:
+    # 1. Vision AI if configured, online, and not explicitly set to local-only
+    online = is_online()
+    if pref in ["hybrid", "gemini"] and api_key and GENAI_AVAILABLE and online:
         try:
             ai_data = extract_with_gemini(image, api_key)
             if ai_data and (ai_data.get("name") or ai_data.get("company_name") or ai_data.get("phone_number") or ai_data.get("email")):
@@ -1162,11 +1221,11 @@ def process_card_image(image: Image.Image) -> Dict[str, Any]:
         except Exception as e:
             print(f"[Engine] Vision AI exception, falling back: {e}")
 
-    # 2. Local High-Precision Tesseract OCR Engine
+    # 2. Local High-Precision Tesseract OCR Engine (Automatic offline fallback)
     raw_text = run_robust_local_ocr(image)
     ocr_data = extract_fields_from_text(raw_text)
     ocr_data["raw_text"] = raw_text
-    ocr_data["ocr_engine"] = "Local OCR (Tesseract)"
+    ocr_data["ocr_engine"] = "Local OCR (Tesseract - Offline Mode)" if not online else "Local OCR (Tesseract)"
     return ocr_data
 
 
@@ -1514,6 +1573,19 @@ def api_settings():
     })
 
 
+@app.route("/api/network-status", methods=["GET"])
+def api_network_status():
+    """Returns real-time background internet connectivity status and ping latency."""
+    online = is_online()
+    return jsonify({
+        "online": online,
+        "latency_ms": NETWORK_STATE["latency_ms"],
+        "last_checked": NETWORK_STATE["last_checked"],
+        "status": "online" if online else "offline",
+        "message": "Internet connected" if online else "No internet connection (Offline mode)"
+    })
+
+
 # ==========================================
 # 5. EXPORT ENGINE (EXCEL, CSV, VCARD)
 # ==========================================
@@ -1833,6 +1905,61 @@ FRONTEND_HTML = """
         .engine-pill.invalid .engine-dot {
             background: #dc2626;
             box-shadow: 0 0 8px #dc2626;
+        }
+
+        /* NETWORK CONNECTIVITY PILL */
+        .network-pill {
+            font-size: 12px;
+            font-weight: 700;
+            padding: 6px 14px;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.25s ease;
+            user-select: none;
+        }
+        .network-pill.online {
+            background: #f0fdf4;
+            color: #15803d;
+            border: 1px solid #bbf7d0;
+        }
+        .network-pill.offline {
+            background: #fef2f2;
+            color: #b91c1c;
+            border: 1px solid #fecaca;
+            animation: pulse-offline 1.6s infinite;
+        }
+        .network-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 8px #22c55e;
+        }
+        .network-pill.offline .network-dot {
+            background: #ef4444;
+            box-shadow: 0 0 8px #ef4444;
+        }
+        @keyframes pulse-offline {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.55; }
+        }
+        .offline-banner {
+            display: none;
+            background: linear-gradient(90deg, #dc2626, #b91c1c);
+            color: #ffffff;
+            padding: 10px 20px;
+            font-size: 13px;
+            font-weight: 700;
+            text-align: center;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            box-shadow: 0 2px 10px rgba(220, 38, 38, 0.25);
+        }
+        .offline-banner.active {
+            display: flex;
         }
 
         /* CONTAINER */
@@ -2342,12 +2469,22 @@ FRONTEND_HTML = """
         </div>
 
         <div class="nav-actions">
+            <div class="network-pill online" id="networkPill" title="Internet Connectivity">
+                <span class="network-dot"></span>
+                <span id="networkText">Online</span>
+            </div>
             <div class="engine-pill" id="engineStatusPill">
                 <span class="engine-dot"></span>
                 <span id="engineStatusText">Checking AI...</span>
             </div>
         </div>
     </header>
+
+    <!-- OFFLINE WARNING BANNER -->
+    <div id="offlineBanner" class="offline-banner">
+        <span>⚠️</span>
+        <span><strong>You are offline:</strong> Internet disconnected. Scanner is operating in Offline Local OCR mode. Reconnect to resume Gemini AI and Neon database sync.</span>
+    </div>
 
     <!-- MAIN CONTAINER -->
     <main class="main-container">
@@ -3119,10 +3256,50 @@ FRONTEND_HTML = """
             }, 'image/jpeg', 0.95);
         }
 
+        // NETWORK CONNECTIVITY MONITOR
+        function setNetworkUI(online, latency) {
+            const pill = document.getElementById('networkPill');
+            const txt = document.getElementById('networkText');
+            const banner = document.getElementById('offlineBanner');
+            if (!pill || !txt) return;
+
+            if (online) {
+                pill.className = 'network-pill online';
+                txt.textContent = latency && latency > 0 ? `Online (${latency}ms)` : 'Online';
+                pill.title = 'Internet Connected: Cloud AI and Neon Database sync active';
+                if (banner) banner.classList.remove('active');
+            } else {
+                pill.className = 'network-pill offline';
+                txt.textContent = 'Offline';
+                pill.title = 'No Internet Connection: Scanner operates in local offline OCR mode';
+                if (banner) banner.classList.add('active');
+            }
+        }
+
+        async function pollNetworkStatus() {
+            try {
+                if (!navigator.onLine) {
+                    setNetworkUI(false);
+                    return;
+                }
+                const resp = await fetch('/api/network-status', { cache: 'no-store' });
+                if (!resp.ok) throw new Error('Network check failed');
+                const data = await resp.json();
+                setNetworkUI(data.online, data.latency_ms);
+            } catch (err) {
+                setNetworkUI(false);
+            }
+        }
+
+        window.addEventListener('online', () => pollNetworkStatus());
+        window.addEventListener('offline', () => setNetworkUI(false));
+
         // INIT
         window.addEventListener('DOMContentLoaded', () => {
             loadSettings();
             loadStats();
+            pollNetworkStatus();
+            setInterval(pollNetworkStatus, 6000);
         });
     </script>
 </body>
