@@ -32,6 +32,10 @@ echo [3/3] Setting up distribution files...
 if exist .env copy /y .env "dist\CardScanner\.env" >nul
 if not exist "dist\CardScanner\uploads" mkdir "dist\CardScanner\uploads"
 
+:: Clean up intermediate compile artifacts to save disk space
+if exist build rmdir /s /q build
+if exist CardScanner.spec del /q CardScanner.spec
+
 echo.
 echo =======================================================
 echo [SUCCESS] Standalone app created in: dist\CardScanner\
