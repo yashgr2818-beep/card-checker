@@ -87,8 +87,7 @@ This application is an enterprise-grade **Business Card Scanner and Lead Managem
            │
            ▼
 [Lead CRM & Export Engine]
-   • Real-time search, filters, pagination, batch delete
-   • 1-Click Export to Excel (.xlsx), CSV (.csv), or vCard (.vcf for phones)
+   • 1-Click Export to CSV (`.csv` with UTF-8 BOM encoding)
 ```
 
 ---
@@ -233,9 +232,7 @@ The app connects to **Neon Cloud PostgreSQL** over SSL (`sslmode=require`):
 | `/api/settings` | `GET` / `POST` | Manages API keys, database connection strings, and engine preferences. |
 | `/api/settings/verify-key` | `POST` | Live test endpoint validating Gemini API keys with Google servers. |
 | `/api/corrections` | `GET` | Returns all learned correction rules. |
-| `/api/export/excel` | `GET` | Generates and downloads styled `.xlsx` spreadsheet. |
-| `/api/export/csv` | `GET` | Downloads standard `.csv` file. |
-| `/api/export/vcard` | `GET` | Downloads `.vcf` file for 1-tap import into smartphone contacts. |
+| `/api/export/csv` | `GET` | Generates and downloads UTF-8 BOM encoded `.csv` file. |
 
 ---
 

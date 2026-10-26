@@ -24,6 +24,7 @@ from flask import (
     render_template_string,
     send_file,
     send_from_directory,
+    redirect,
 )
 from PIL import Image, ImageOps
 import pytesseract
@@ -1716,73 +1717,8 @@ def api_network_status():
 
 
 # ==========================================
-# 5. EXPORT ENGINE (EXCEL, CSV, VCARD)
+# 5. EXPORT ENGINE (CSV)
 # ==========================================
-
-@app.route("/api/export/excel", methods=["GET"])
-def export_excel():
-    """Export contacts to beautifully styled Excel spreadsheet."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM contacts ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "BizConnect Contacts"
-
-    headers = [
-        "ID", "Full Name", "Job Title", "Company", "Mobile / Phone",
-        "Email", "Website", "Full Address", "Products & Services",
-        "Status", "Notes", "Scanned Date", "AI / OCR Engine"
-    ]
-    ws.append(headers)
-
-    # Style Header Row
-    header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    thin_border = Border(
-        left=Side(style="thin", color="CBD5E1"),
-        
-        right=Side(style="thin", color="CBD5E1"),
-        top=Side(style="thin", color="CBD5E1"),
-        bottom=Side(style="thin", color="CBD5E1")
-    )
-
-    for col_num in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    # Append Data Rows
-    for r in rows:
-        ws.append([
-            r["id"], r["name"], r["job_title"], r["company_name"],
-            r["phone_number"], r["email"], r["website"], r["address"],
-            r["services_products"], r["lead_status"], r["notes"],
-            r["created_at"], r["ocr_engine"]
-        ])
-
-    # Auto-adjust column widths
-    for col in ws.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        col_letter = col[0].column_letter
-        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 40)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    filename = f"BizConnect_Contacts_{datetime.now().strftime('%Y%m%d')}.xlsx"
-    return send_file(
-        buf,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
 
 @app.route("/api/export/csv", methods=["GET"])
 def export_csv():
@@ -1794,7 +1730,7 @@ def export_csv():
     conn.close()
 
     output = io.StringIO()
-    # Write UTF-8 BOM so Excel opens accented characters seamlessly
+    # Write UTF-8 BOM so Excel and spreadsheet editors open accented characters seamlessly
     output.write("\ufeff")
     writer = csv.writer(output)
 
@@ -1822,56 +1758,12 @@ def export_csv():
     )
 
 
+@app.route("/api/export/excel", methods=["GET"])
 @app.route("/api/export/vcf", methods=["GET"])
 @app.route("/api/export/vcf/<int:cid>", methods=["GET"])
-def export_vcard(cid=None):
-    """Export contacts as vCard 3.0 (.vcf) for instant Google/Outlook/iPhone import."""
-    conn = get_db()
-    c = conn.cursor()
-    if cid:
-        c.execute("SELECT * FROM contacts WHERE id = ?", (cid,))
-    else:
-        c.execute("SELECT * FROM contacts ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-
-    vcf_content = []
-    for r in rows:
-        name_parts = (r["name"] or "Contact").split(" ")
-        first_name = name_parts[0]
-        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
-
-        card_lines = [
-            "BEGIN:VCARD",
-            "VERSION:3.0",
-            f"N:{last_name};{first_name};;;",
-            f"FN:{r['name']}",
-            f"ORG:{r['company_name'] or ''}",
-            f"TITLE:{r['job_title'] or ''}",
-        ]
-        if r["phone_number"]:
-            card_lines.append(f"TEL;TYPE=CELL,VOICE:{r['phone_number']}")
-        if r["email"]:
-            card_lines.append(f"EMAIL;TYPE=WORK,INTERNET:{r['email']}")
-        if r["website"]:
-            card_lines.append(f"URL:{r['website']}")
-        if r["address"]:
-            clean_addr = r["address"].replace(";", ",")
-            card_lines.append(f"ADR;TYPE=WORK:;;{clean_addr};;;;")
-        if r["notes"] or r["services_products"]:
-            note_content = f"{r['notes']} | Services: {r['services_products']}".strip(" |")
-            card_lines.append(f"NOTE:{note_content}")
-        card_lines.append("END:VCARD\n")
-        vcf_content.append("\n".join(card_lines))
-
-    buf = io.BytesIO("\n".join(vcf_content).encode("utf-8"))
-    fname = f"contact_{cid}.vcf" if cid else f"BizConnect_All_Contacts_{datetime.now().strftime('%Y%m%d')}.vcf"
-    return send_file(
-        buf,
-        as_attachment=True,
-        download_name=fname,
-        mimetype="text/vcard",
-    )
+def export_legacy_redirect(cid=None):
+    """Graceful redirect to CSV export."""
+    return redirect("/api/export/csv")
 
 
 # ==========================================
@@ -2694,14 +2586,8 @@ FRONTEND_HTML = """
                         <option value="Customer">Customers</option>
                     </select>
 
-                    <a href="/api/export/excel" class="btn btn-success" title="Download Excel format">
-                        📊 Export Excel
-                    </a>
-                    <a href="/api/export/csv" class="btn btn-secondary" title="Download CSV">
-                        📄 Export CSV
-                    </a>
-                    <a href="/api/export/vcf" class="btn btn-primary" title="Export as phone contact vCards">
-                        📲 Download vCards
+                    <a href="/api/export/csv" class="btn btn-primary" title="Download all contacts as CSV file">
+                        📥 Download CSV File
                     </a>
                 </div>
             </div>
@@ -3228,7 +3114,6 @@ FRONTEND_HTML = """
                     <div class="contact-footer">
                         <div style="font-size:11px; color:#94a3b8;">${c.created_at || ''}</div>
                         <div style="display:flex; gap:6px;">
-                            <a href="/api/export/vcf/${c.id}" class="btn btn-sm btn-secondary" title="Download Phone vCard">📇 vCard</a>
                             <button class="btn btn-sm btn-secondary" onclick="openReviewById(${c.id})">✏️ Edit</button>
                             <button class="btn btn-sm btn-outline-danger" onclick="deleteContact(${c.id})">🗑️</button>
                         </div>

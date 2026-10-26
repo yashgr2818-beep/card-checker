@@ -30,10 +30,8 @@ A modern, high-accuracy AI business card scanner and CRM suite matching the feat
   - Real-time search across Name, Company, Email, Phone, and City.
   - Lead pipeline tracking (`New Leads`, `Contacted`, `Qualified`, `Converted / Customer`).
   - Follow-up dates and notes.
-- **1-Click Exports**:
-  - 📊 **Excel (.xlsx)** with auto-sized columns and clean formatting.
-  - 📄 **CSV** with UTF-8 BOM encoding.
-  - 📲 **vCard (.vcf 3.0)** for instant 1-tap import into Google Contacts, Apple iPhone, or Outlook.
+- **1-Click Export**:
+  - 📥 **CSV (.csv)** with UTF-8 BOM encoding for seamless opening in Excel, Google Sheets, or CRM systems.
 - **Standalone Windows Executable**:
   - Pre-compiled standalone `CardScanner.exe` bundled inside `dist/CardScanner/`—runs on any Windows computer **without installing Python**.
 
