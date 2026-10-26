@@ -244,6 +244,7 @@ def upload_image_to_cloud(image_source, filename: str) -> Optional[str]:
         print(f"[Cloudinary] Upload failed ({e}), falling back to local file storage.")
         return None
 
+_CLOUD_URL_CACHE: Dict[str, str] = {}
 
 
 # ==========================================
@@ -570,9 +571,19 @@ def get_genai_client(api_key: str):
     return _GENAI_CLIENT_CACHE[k]
 
 
+_GEMINI_COOLDOWN_UNTIL = 0.0
+_GEMINI_COOLDOWN_REASON = ""
+
+
 def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, Any]]:
-    """Extract card details with Google Gemini Vision API."""
+    """Extract card details with Google Gemini Vision API with circuit-breaker protection."""
+    global _GEMINI_COOLDOWN_UNTIL, _GEMINI_COOLDOWN_REASON
     if not GENAI_AVAILABLE or not api_key:
+        return None
+
+    # Circuit breaker: if quota was exceeded or key invalid, skip immediately without waiting
+    now = time.time()
+    if now < _GEMINI_COOLDOWN_UNTIL:
         return None
 
     try:
@@ -605,18 +616,17 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
             img_rgb = image.convert("RGB")
         else:
             img_rgb = image.copy()
-        img_rgb.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+        img_rgb.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
 
         buf = io.BytesIO()
         img_rgb.save(buf, format="JPEG", quality=85, optimize=True)
         img_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
-        # Active current models in priority order
+        # Active current models in priority order (flash-lite first for sub-second speed & generous quota)
         models_to_try = [
+            "gemini-3.5-flash-lite",
             "gemini-3.8-flash",
             "gemini-3.5-flash",
-            "gemini-flash-latest",
-            "gemini-2.5-flash",
         ]
         last_error = None
 
@@ -636,7 +646,19 @@ def extract_with_gemini(image: Image.Image, api_key: str) -> Optional[Dict[str, 
                     parsed["ocr_engine"] = f"Vision AI ({model_name})"
                     return parsed
             except Exception as e:
+                err_str = str(e)
                 last_error = e
+                # Quota exceeded (429): Google rate limit hit across project. Immediately break and cooldown!
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota exceeded" in err_str:
+                    _GEMINI_COOLDOWN_UNTIL = time.time() + 900  # 15 min cooldown
+                    _GEMINI_COOLDOWN_REASON = "Free Tier Quota Limit Exceeded (429)"
+                    print(f"[Gemini Vision] 429 Quota Exceeded. Entering fast-fallback mode for 15m.")
+                    break
+                elif "400" in err_str or "API_KEY_INVALID" in err_str:
+                    _GEMINI_COOLDOWN_UNTIL = time.time() + 3600
+                    _GEMINI_COOLDOWN_REASON = "Invalid API Key"
+                    print(f"[Gemini Vision] Invalid API key. Entering fast-fallback mode for 1h.")
+                    break
                 continue
 
         if last_error:
@@ -671,7 +693,7 @@ def test_gemini_api_key(api_key: str, force: bool = False) -> Dict[str, Any]:
 
     try:
         client = get_genai_client(key)
-        for m in ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"]:
+        for m in ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]:
             try:
                 resp = client.models.generate_content(model=m, contents="ping")
                 if resp and resp.text:
@@ -680,6 +702,10 @@ def test_gemini_api_key(api_key: str, force: bool = False) -> Dict[str, Any]:
                     return res
             except Exception as m_err:
                 err_str = str(m_err)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota exceeded" in err_str:
+                    res = {"valid": False, "status": "quota_exceeded", "message": "Google Free Tier Quota Exceeded (429). Fast Local OCR is active."}
+                    _GEMINI_KEY_CACHE = {"key": key, **res}
+                    return res
                 if "400" in err_str or "API_KEY_INVALID" in err_str or "API key not valid" in err_str:
                     res = {"valid": False, "status": "invalid", "message": "Google rejected key: Invalid API Key."}
                     _GEMINI_KEY_CACHE = {"key": key, **res}
@@ -750,11 +776,15 @@ def run_robust_local_ocr(image: Image.Image) -> str:
 
     # Step 2: High-resolution adaptive extraction on winning angle
     best_rotated = image.rotate(best_rot, expand=True) if best_rot != 0 else image
-    scale2 = min(1800 / max(best_rotated.width, best_rotated.height), 1.3)
-    proc = best_rotated.resize(
-        (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
-        Image.Resampling.BILINEAR,
-    )
+    # Downscaling to max 1200 gives optimal OCR character clarity while taking half the CPU time of 1800
+    scale2 = min(1200 / max(best_rotated.width, best_rotated.height), 1.0)
+    if scale2 < 1.0:
+        proc = best_rotated.resize(
+            (int(best_rotated.width * scale2), int(best_rotated.height * scale2)),
+            Image.Resampling.BILINEAR,
+        )
+    else:
+        proc = best_rotated
     gray = proc.convert("L")
 
     # Primary pass: middle threshold (162) captures 90%+ of all cards cleanly
@@ -772,9 +802,9 @@ def run_robust_local_ocr(image: Image.Image) -> str:
     except Exception:
         pass
 
-    # Adaptive secondary pass: ONLY run if primary pass yielded sparse lines or missed contact info
+    # Adaptive secondary pass: ONLY run if primary pass yielded very few lines or missed contact info
     has_contact = any("@" in l or re.search(r"\d{6,}", l) for l in all_lines)
-    if len(all_lines) < 8 or not has_contact:
+    if len(all_lines) < 6 or not has_contact:
         for threshold_val in [150, 175]:
             try:
                 thresh_alt = gray.point(lambda p: 255 if p > threshold_val else 0)
@@ -784,7 +814,7 @@ def run_robust_local_ocr(image: Image.Image) -> str:
                     if len(cl) >= 3 and cl.lower() not in seen:
                         seen.add(cl.lower())
                         all_lines.append(cl)
-                if len(all_lines) >= 10 and any("@" in l for l in all_lines):
+                if len(all_lines) >= 8 and any("@" in l for l in all_lines):
                     break
             except Exception:
                 continue
@@ -1349,14 +1379,32 @@ def api_scan():
             img = Image.open(io.BytesIO(image_bytes))
             data = process_card_image(img)
 
-            # Cloudinary cloud storage upload with local fallback
-            cloud_url = upload_image_to_cloud(image_bytes, filename)
-            if cloud_url:
-                data["image_filename"] = cloud_url
-                data["image_url"] = cloud_url
-            else:
-                data["image_filename"] = filename
-                data["image_url"] = f"/uploads/{filename}"
+            # Instant local response for sub-second UI rendering
+            data["image_filename"] = filename
+            data["image_url"] = f"/uploads/{filename}"
+
+            # Asynchronous background upload to Cloudinary CDN so UI response is immediate
+            def _bg_cloud_upload(b_data, fn_name):
+                try:
+                    c_url = upload_image_to_cloud(b_data, fn_name)
+                    if c_url:
+                        _CLOUD_URL_CACHE[fn_name] = c_url
+                        # If contact was already saved in DB with local filename, upgrade it to CDN URL
+                        try:
+                            c_conn = get_db()
+                            c_cur = c_conn.cursor()
+                            c_cur.execute(
+                                "UPDATE contacts SET image_filename = ? WHERE image_filename = ?",
+                                (c_url, fn_name)
+                            )
+                            c_conn.commit()
+                            c_conn.close()
+                        except Exception:
+                            pass
+                except Exception as bg_e:
+                    print(f"[Cloudinary] Background upload notice: {bg_e}")
+
+            threading.Thread(target=_bg_cloud_upload, args=(image_bytes, filename), daemon=True).start()
 
             results.append(data)
 
@@ -1429,6 +1477,8 @@ def api_create_contact():
             tags, image_filename, ocr_engine, raw_text, created_at, follow_up_date
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
+    raw_img_fn = data.get("image_filename", "").strip()
+    resolved_img_fn = _CLOUD_URL_CACHE.get(raw_img_fn, raw_img_fn)
     params = (
         data.get("name", "").strip(),
         data.get("job_title", "").strip(),
@@ -1441,7 +1491,7 @@ def api_create_contact():
         data.get("notes", "").strip(),
         data.get("lead_status", "New").strip(),
         data.get("tags", "").strip(),
-        data.get("image_filename", "").strip(),
+        resolved_img_fn,
         data.get("ocr_engine", "Local Tesseract OCR").strip(),
         data.get("raw_text", "").strip(),
         now,
