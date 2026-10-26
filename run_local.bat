@@ -22,7 +22,7 @@ if errorlevel 1 (
 
 :: 2. Check if required Python packages are installed
 echo [1/3] Checking Python dependencies...
-python -c "import flask, PIL, pytesseract, psycopg2, openpyxl, dotenv" >nul 2>nul
+python -c "import flask, PIL, pytesseract, psycopg2, openpyxl, dotenv, cloudinary" >nul 2>nul
 if errorlevel 1 (
     echo [SETUP] First-time setup detected on this system.
     echo Installing required packages from requirements.txt...

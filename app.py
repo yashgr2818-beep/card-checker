@@ -49,6 +49,15 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
+# Cloudinary Cloud Storage SDK
+try:
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_AVAILABLE = True
+except Exception:
+    CLOUDINARY_AVAILABLE = False
+
+
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -184,6 +193,57 @@ def get_settings() -> Dict[str, Any]:
 def save_settings(settings: Dict[str, Any]):
     with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+
+
+# ==========================================
+# Cloudinary Cloud Storage Integration
+# ==========================================
+def init_cloudinary() -> bool:
+    """Configures Cloudinary with credentials from environment or settings."""
+    if not CLOUDINARY_AVAILABLE:
+        return False
+    c_url = os.environ.get("CLOUDINARY_URL", "").strip()
+    c_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    c_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    c_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+
+    if c_url:
+        try:
+            cloudinary.config(cloudinary_url=c_url, secure=True)
+            return True
+        except Exception:
+            pass
+    if c_name and c_key and c_secret:
+        try:
+            cloudinary.config(cloud_name=c_name, api_key=c_key, api_secret=c_secret, secure=True)
+            return True
+        except Exception:
+            pass
+    return False
+
+init_cloudinary()
+
+def upload_image_to_cloud(image_source, filename: str) -> Optional[str]:
+    """
+    Uploads an image (bytes, stream, or file path) to Cloudinary.
+    Returns the secure HTTPS CDN URL, or None if offline/unconfigured.
+    """
+    if not is_online() or not init_cloudinary():
+        return None
+    try:
+        base_name = os.path.splitext(os.path.basename(filename))[0]
+        res = cloudinary.uploader.upload(
+            image_source,
+            folder="bizconnect_cards",
+            public_id=base_name,
+            resource_type="image",
+            overwrite=True,
+        )
+        return res.get("secure_url")
+    except Exception as e:
+        print(f"[Cloudinary] Upload failed ({e}), falling back to local file storage.")
+        return None
+
 
 
 # ==========================================
@@ -1288,8 +1348,15 @@ def api_scan():
             # Process with Hybrid AI OCR
             img = Image.open(io.BytesIO(image_bytes))
             data = process_card_image(img)
-            data["image_filename"] = filename
-            data["image_url"] = f"/uploads/{filename}"
+
+            # Cloudinary cloud storage upload with local fallback
+            cloud_url = upload_image_to_cloud(image_bytes, filename)
+            if cloud_url:
+                data["image_filename"] = cloud_url
+                data["image_url"] = cloud_url
+            else:
+                data["image_filename"] = filename
+                data["image_url"] = f"/uploads/{filename}"
 
             results.append(data)
 
@@ -1329,7 +1396,17 @@ def api_get_contacts():
 
     query += " ORDER BY id DESC"
     c.execute(query, params)
-    rows = [dict(row) for row in c.fetchall()]
+    rows = []
+    for row in c.fetchall():
+        d = dict(row)
+        img_fn = d.get("image_filename") or ""
+        if img_fn.startswith("http://") or img_fn.startswith("https://"):
+            d["image_url"] = img_fn
+        elif img_fn:
+            d["image_url"] = f"/uploads/{img_fn}"
+        else:
+            d["image_url"] = ""
+        rows.append(d)
     conn.close()
 
     return jsonify({"contacts": rows, "count": len(rows)})
@@ -1570,6 +1647,8 @@ def api_settings():
         "genai_sdk_installed": GENAI_AVAILABLE,
         "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
         "db_engine": "Neon Cloud PostgreSQL (Active)",
+        "cloudinary_enabled": CLOUDINARY_AVAILABLE and bool(os.environ.get("CLOUDINARY_CLOUD_NAME") or os.environ.get("CLOUDINARY_URL")),
+        "cloudinary_cloud_name": os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
     })
 
 
@@ -2907,6 +2986,12 @@ FRONTEND_HTML = """
             }
         }
 
+        function openQueueReview(idx) {
+            if (scannedCardsQueue && scannedCardsQueue[idx]) {
+                openReviewModal(scannedCardsQueue[idx]);
+            }
+        }
+
         // REVIEW / EDIT MODAL
         let currentScannedOriginal = null;
 
@@ -2940,8 +3025,9 @@ FRONTEND_HTML = """
             document.getElementById('fieldNotes').value = cardData.notes || '';
 
             const imgEl = document.getElementById('modalPreviewImg');
-            if (cardData.image_filename) {
-                imgEl.src = '/uploads/' + cardData.image_filename;
+            const imgSrc = cardData.image_url || cardData.image_filename;
+            if (imgSrc) {
+                imgEl.src = (imgSrc.startsWith('http://') || imgSrc.startsWith('https://')) ? imgSrc : ('/uploads/' + imgSrc);
                 imgEl.style.display = 'block';
             } else {
                 imgEl.style.display = 'none';
@@ -3042,8 +3128,9 @@ FRONTEND_HTML = """
                 cardEl.className = 'contact-card';
 
                 const initials = (c.name || 'C').split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase();
-                const thumbHtml = c.image_filename ?
-                    `<img src="/uploads/${c.image_filename}" class="contact-thumb-prev" onclick="openReviewById(${c.id})" title="Click to inspect card">` : '';
+                const thumbSrc = c.image_url || (c.image_filename ? ((c.image_filename.startsWith('http://') || c.image_filename.startsWith('https://')) ? c.image_filename : `/uploads/${c.image_filename}`) : '');
+                const thumbHtml = thumbSrc ?
+                    `<img src="${thumbSrc}" class="contact-thumb-prev" onclick="openReviewById(${c.id})" title="Click to inspect card">` : '';
 
                 cardEl.innerHTML = `
                     <div>
@@ -3077,6 +3164,11 @@ FRONTEND_HTML = """
                 `;
                 grid.appendChild(cardEl);
             });
+        }
+
+        function openReviewById(cid) {
+            const contact = allContacts.find(x => x.id === cid);
+            if (contact) openReviewModal(contact, true);
         }
 
         async function deleteContact(cid) {
