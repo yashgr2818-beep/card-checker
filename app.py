@@ -2883,6 +2883,21 @@ FRONTEND_HTML = """
         let scannedCardsQueue = [];
         let videoStream = null;
 
+        function resolveImageUrl(src) {
+            if (!src) return '';
+            src = src.trim();
+            if (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('data:')) {
+                return src;
+            }
+            if (src.startsWith('/uploads/')) {
+                return src;
+            }
+            if (src.startsWith('uploads/')) {
+                return '/' + src;
+            }
+            return '/uploads/' + src;
+        }
+
         function openReviewById(cid) {
             const card = allContacts.find(c => c.id === cid);
             if (card) openReviewModal(card, true);
@@ -3014,7 +3029,7 @@ FRONTEND_HTML = """
                     const item = document.createElement('div');
                     item.className = 'queue-card';
                     item.innerHTML = `
-                        <img src="${card.image_url}" class="queue-thumb" alt="Card Thumbnail">
+                        <img src="${resolveImageUrl(card.image_url || card.image_filename)}" class="queue-thumb" alt="Card Thumbnail">
                         <div class="queue-details">
                             <div class="queue-name">${card.name || 'Unnamed Contact'}</div>
                             <div class="queue-comp">${card.job_title || ''} • ${card.company_name || 'No Company'}</div>
@@ -3075,10 +3090,17 @@ FRONTEND_HTML = """
             document.getElementById('fieldNotes').value = cardData.notes || '';
 
             const imgEl = document.getElementById('modalPreviewImg');
-            const imgSrc = cardData.image_url || cardData.image_filename;
+            const rawSrc = cardData.image_url || cardData.image_filename;
+            const imgSrc = resolveImageUrl(rawSrc);
             if (imgSrc) {
-                imgEl.src = (imgSrc.startsWith('http://') || imgSrc.startsWith('https://')) ? imgSrc : ('/uploads/' + imgSrc);
+                imgEl.src = imgSrc;
                 imgEl.style.display = 'block';
+                imgEl.onerror = function() {
+                    // Fallback to local uploads if CDN or relative URL fails
+                    if (cardData.image_filename && !this.src.endsWith('/' + cardData.image_filename)) {
+                        this.src = '/uploads/' + cardData.image_filename;
+                    }
+                };
             } else {
                 imgEl.style.display = 'none';
             }
@@ -3178,7 +3200,7 @@ FRONTEND_HTML = """
                 cardEl.className = 'contact-card';
 
                 const initials = (c.name || 'C').split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase();
-                const thumbSrc = c.image_url || (c.image_filename ? ((c.image_filename.startsWith('http://') || c.image_filename.startsWith('https://')) ? c.image_filename : `/uploads/${c.image_filename}`) : '');
+                const thumbSrc = resolveImageUrl(c.image_url || c.image_filename);
                 const thumbHtml = thumbSrc ?
                     `<img src="${thumbSrc}" class="contact-thumb-prev" onclick="openReviewById(${c.id})" title="Click to inspect card">` : '';
 
