@@ -28,8 +28,6 @@ from flask import (
 )
 from PIL import Image, ImageOps
 import pytesseract
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # Optional PostgreSQL (Neon DB) support with connection pooling
 try:
